@@ -4,11 +4,11 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 
-#include "common/mask.cuh"
-#include "common/utils.hpp"
+#include "sm120/prefill/dense/common/mask.cuh"
+#include "sm120/prefill/dense/common/utils.hpp"
 
-#include "sm100_kernel_traits.hpp"
-#include "fmha_cutlass_fwd_sm100.cuh"
+#include "sm120/prefill/dense/sm120_kernel_traits.hpp"
+#include "sm120/prefill/dense/fmha_cutlass_fwd_sm120.cuh"
 
 template <class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -48,23 +48,20 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   cudaGetDeviceProperties(&prop, device);
   const int sm_version = prop.major * 10 + prop.minor;
 
-#ifndef FLASH_MLA_DISABLE_SM100
   TORCH_CHECK(
-      sm_version >= 100 && sm_version < 110,
-      "flash_mla_sm100 build only supports SM100-class GPUs. Detected sm_",
+      sm_version >= 120 && sm_version < 130,
+      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
       prop.major,
       prop.minor,
-      ". Please load the SM120 build on workstation parts.");
-  run_fmha_fwd<flash::Sm100ServerConfig, Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
+      ". Please install the SM100 build for server parts.");
+
+  run_fmha_fwd<flash::Sm120WorkstationConfig, Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
       workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
       softmax_scale, max_seqlen_q, max_seqlen_kv);
-#else
-  TORCH_CHECK(false, "SM100 kernels are disabled in this build.");
-#endif
 #endif
 }
 
-void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
+void FMHACutlassSM120FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
                             at::Tensor v, at::Tensor cumulative_seqlen_q,
                             at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
                             int mask_mode_code, float sm_scale, int max_seqlen_q,

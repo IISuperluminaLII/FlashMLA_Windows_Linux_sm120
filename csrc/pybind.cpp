@@ -33,17 +33,37 @@ namespace py = pybind11;
 #include "sm90/prefill/sparse/fwd.h"
 #endif
 
-// Dense prefill interface supports BOTH SM100a and SM120
+// Dense prefill interface depends on build target
+#if defined(FLASH_MLA_BUILD_SM100)
 #include "sm100/prefill/dense/interface.h"
+#elif defined(FLASH_MLA_BUILD_SM120)
+#include "sm120/prefill/dense/interface.h"
+#else
+#error "A FlashMLA build target must define FLASH_MLA_BUILD_SM100 or FLASH_MLA_BUILD_SM120"
+#endif
+
+#if defined(FLASH_MLA_BUILD_SM100)
+#define FLASH_MLA_DENSE_FWD_RUN FMHACutlassSM100FwdRun
+#define FLASH_MLA_DENSE_BWD_RUN FMHACutlassSM100BwdRun
+static constexpr const char* kFlashMlaVariantName = "sm100";
+#elif defined(FLASH_MLA_BUILD_SM120)
+#define FLASH_MLA_DENSE_FWD_RUN FMHACutlassSM120FwdRun
+#define FLASH_MLA_DENSE_BWD_RUN FMHACutlassSM120BwdRun
+static constexpr const char* kFlashMlaVariantName = "sm120";
+#endif
 
 // Provide stub implementation when backward is disabled
 #ifdef FLASH_MLA_SM120_DISABLE_BWD
-void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
-                            at::Tensor v, at::Tensor o, at::Tensor lse,
-                            at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
-                            at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                            int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) {
-    TORCH_CHECK(false, "SM120 backward pass is disabled in this build. Please rebuild without FLASH_MLA_SM120_DISABLE_BWD flag to enable backward pass.");
+void FLASH_MLA_DENSE_BWD_RUN(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q,
+                             at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor lse,
+                             at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
+                             at::Tensor dq, at::Tensor dk, at::Tensor dv,
+                             int mask_mode_code, float softmax_scale, int max_seqlen_q,
+                             int max_seqlen_kv, bool is_varlen) {
+    TORCH_CHECK(
+        false,
+        "SM120 backward pass is disabled in this build. Please rebuild without "
+        "FLASH_MLA_SM120_DISABLE_BWD flag to enable backward pass.");
 }
 #endif
 
@@ -77,14 +97,27 @@ struct Arch {
     }
 
     void assert_is_supported() const {
-#if defined(FLASH_MLA_DISABLE_SM90) && defined(FLASH_MLA_DISABLE_SM100)
-        TORCH_CHECK(false, "FlashMLA was compiled without SM90 and SM100 support (likely due to Windows/MSVC compatibility issues). No architectures are available. Please compile on Linux or WSL2 for full support.");
-#elif defined(FLASH_MLA_DISABLE_SM90)
-        TORCH_CHECK(is_sm100() || is_sm120(), "Only SM100/SM120 (Blackwell) is supported in this build. Your GPU architecture sm_", major, minor, " is not supported.");
-#elif defined(FLASH_MLA_DISABLE_SM100)
-        TORCH_CHECK(is_sm90(), "Only SM90 (Hopper) is supported in this build. Your GPU architecture sm_", major, minor, " is not supported.");
+#if defined(FLASH_MLA_BUILD_SM100)
+        TORCH_CHECK(
+            is_sm100(),
+            "flash_mla_sm100 was compiled for Blackwell server GPUs (SM100). Detected sm_",
+            major,
+            minor,
+            ". Please install the SM120 build for workstation-class devices.");
+#elif defined(FLASH_MLA_BUILD_SM120)
+        TORCH_CHECK(
+            is_sm120(),
+            "flash_mla_sm120 was compiled for Blackwell workstation GPUs (SM120). Detected sm_",
+            major,
+            minor,
+            ". Please install the SM100 build for server-class devices.");
 #else
-        TORCH_CHECK(is_sm90() || is_sm100() || is_sm120(), "Only SM90 (Hopper) and SM100/SM120 (Blackwell) are supported. Your GPU architecture sm_", major, minor, " is not supported.");
+        TORCH_CHECK(
+            is_sm90() || is_sm100() || is_sm120(),
+            "Only SM90 (Hopper) and SM100/SM120 (Blackwell) are supported. Your GPU architecture sm_",
+            major,
+            minor,
+            " is not supported.");
 #endif
     }
 };
@@ -550,7 +583,7 @@ void dense_prefill_fwd_wrapper(
     int max_seqlen_kv,
     bool is_varlen
 ) {
-    FMHACutlassSM100FwdRun(
+    FLASH_MLA_DENSE_FWD_RUN(
         workspace_buffer, q, k, v,
         cumulative_seqlen_q, cumulative_seqlen_kv,
         o, lse,
@@ -578,7 +611,7 @@ void dense_prefill_bwd_wrapper(
     int max_seqlen_kv,
     bool is_varlen
 ) {
-    FMHACutlassSM100BwdRun(
+    FLASH_MLA_DENSE_BWD_RUN(
         workspace_buffer, d_o, q, k, v, o, lse,
         cumulative_seqlen_q, cumulative_seqlen_kv,
         dq, dk, dv,
@@ -628,4 +661,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_varlen")
     );
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+    m.attr("__flash_mla_variant__") = kFlashMlaVariantName;
 }

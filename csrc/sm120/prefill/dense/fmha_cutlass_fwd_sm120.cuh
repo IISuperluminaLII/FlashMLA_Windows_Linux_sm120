@@ -10,7 +10,7 @@
 #include "kernel/fmha_causal_tile_scheduler.hpp"
 #include "kernel/fmha_options.hpp"
 #include "kernel/fmha_tile_scheduler.hpp"
-#include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+#include "kernel/sm120_fmha_fwd_kernel_tma_warpspecialized.hpp"
 #include "sm120_fallback_utils.h"
 
 #ifndef FLASH_MLA_SKIP_TORCH_HEADERS
@@ -128,16 +128,16 @@ struct FwdRunner {
 
   // Operations remain the same, using selected mainloop
   using OperationMla =
-      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm120FmhaFwdKernelTmaWarpspecialized<
           KernelTraits,
           ProblemShapeType, MainloopMla,
           cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
               ElementOut, ElementAccumulatorPV, typename MainloopMla::TileShapePV, StrideO,
               StrideLSE, OrderLoadEpilogue>,
-          TileScheduler, cutlass::fmha::kernel::Sm100MlaFwdCtxKernelWarpspecializedSchedule>>;
+          TileScheduler, cutlass::fmha::kernel::Sm120MlaFwdCtxKernelWarpspecializedSchedule>>;
 
   using OperationFmha =
-      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm120FmhaFwdKernelTmaWarpspecialized<
           KernelTraits,
           ProblemShapeType, MainloopFmha,
           cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<

@@ -45,10 +45,10 @@
 #include <cutlass/util/distribution.h>
 #include <cutlass/util/reference/device/tensor_fill.h>
 
-#include "common/utils.hpp"
-#include "collective/fmha_fusion.hpp"
-#include "device/fmha_device_bwd.hpp"
-#include "sm120_fallback_utils.h"
+#include "sm120/prefill/dense/common/utils.hpp"
+#include "sm120/prefill/dense/collective/fmha_fusion.hpp"
+#include "device/fmha_device_bwd_sm120.hpp"
+#include "sm120/prefill/dense/sm120_fallback_utils.h"
 
 #if !defined(FLASH_MLA_DISABLE_USING_DIRECTIVES)
 #if !defined(FLASH_MLA_DISABLE_CUTE_USING)
@@ -89,7 +89,7 @@ struct BwdRunner {
     cute::tuple<int, int, int, int, cute::tuple<int, int>>
   >;
 
-  using Operation = cutlass::fmha::device::Sm100FmhaBwd<KernelTraits, ProblemShape, Element, ElementAccumulator, TileShape, kIsMla, ActiveMask>;
+  using Operation = cutlass::fmha::device::Sm120FmhaBwd<KernelTraits, ProblemShape, Element, ElementAccumulator, TileShape, kIsMla, ActiveMask>;
   
   using TensorStride = Stride<int, _1, Stride<int, int>>; 
   using StrideQ = TensorStride;                               // Seq DQK (H B)
@@ -160,16 +160,17 @@ struct BwdRunner {
     TORCH_CHECK(dv_stride2 == 1);
     TORCH_CHECK(do_stride2 == 1);
 
-    StrideQ stride_Q = make_stride(q_stride0, _1{}, make_stride(q_stride1, B == 1 ? 0 : q_stride0*Q));
-    StrideK stride_K = make_stride(k_stride0, _1{}, make_stride(k_stride1, B == 1 ? 0 : k_stride0*K));
-    StrideV stride_V = make_stride(v_stride0, _1{}, make_stride(v_stride1, B == 1 ? 0 : v_stride0*K));
-    StrideO stride_O = make_stride(o_stride0, _1{}, make_stride(o_stride1, B == 1 ? 0 : o_stride0*Q));
-    StrideLSE stride_LSE = make_stride(_1{}, make_stride(lse_stride1, B == 1 ? 0 : Q));
+    // Avoid zero strides even for B==1 to keep CUTE composition injective
+    StrideQ stride_Q = make_stride(q_stride0, _1{}, make_stride(q_stride1, q_stride0*Q));
+    StrideK stride_K = make_stride(k_stride0, _1{}, make_stride(k_stride1, k_stride0*K));
+    StrideV stride_V = make_stride(v_stride0, _1{}, make_stride(v_stride1, v_stride0*K));
+    StrideO stride_O = make_stride(o_stride0, _1{}, make_stride(o_stride1, o_stride0*Q));
+    StrideLSE stride_LSE = make_stride(_1{}, make_stride(lse_stride1, Q));
 
-    StrideDQ stride_dQ = make_stride(dq_stride0, _1{}, make_stride(dq_stride1, B == 1 ? 0 : dq_stride0*Q));
-    StrideDK stride_dK = make_stride(dk_stride0, _1{}, make_stride(dk_stride1, B == 1 ? 0 : dk_stride0*K));
-    StrideDV stride_dV = make_stride(dv_stride0, _1{}, make_stride(dv_stride1, B == 1 ? 0 : dv_stride0*K));
-    StrideDO stride_dO = make_stride(do_stride0, _1{}, make_stride(do_stride1, B == 1 ? 0 : do_stride0*Q));
+    StrideDQ stride_dQ = make_stride(dq_stride0, _1{}, make_stride(dq_stride1, dq_stride0*Q));
+    StrideDK stride_dK = make_stride(dk_stride0, _1{}, make_stride(dk_stride1, dk_stride0*K));
+    StrideDV stride_dV = make_stride(dv_stride0, _1{}, make_stride(dv_stride1, dv_stride0*K));
+    StrideDO stride_dO = make_stride(do_stride0, _1{}, make_stride(do_stride1, do_stride0*Q));
 
     typename Operation::Arguments arguments{
       problem_shape,
@@ -205,7 +206,7 @@ void run_fmha_bwd(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at:
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                   at::Tensor dq, at::Tensor dk, at::Tensor dv,
                   float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
-#ifdef FLASH_MLA_FORCE_FALLBACK
+#ifdef FLASH_MLA_FORCE_BWD_FALLBACK
   const auto stream = c10::cuda::getCurrentCUDAStream();
   flash::detail::run_fmha_bwd_sm120_fallback<kIsVarlen, kIsMla, Mask>(
       stream,

@@ -1,8 +1,53 @@
+import importlib
+import os
+from types import ModuleType
 from typing import Optional, Tuple
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+
+def _load_flash_mla_extension() -> ModuleType:
+    prefer_arch = os.getenv("FLASH_MLA_RUNTIME_ARCH")
+    candidates = []
+    if prefer_arch:
+        prefer_arch = prefer_arch.lower()
+        if prefer_arch == "sm120":
+            candidates.append(("flash_mla.cuda_sm120", "sm120"))
+        elif prefer_arch == "sm100":
+            candidates.append(("flash_mla.cuda_sm100", "sm100"))
+        elif prefer_arch == "legacy":
+            candidates.append(("flash_mla.cuda", "legacy"))
+
+    candidates.extend(
+        [
+            ("flash_mla.cuda_sm120", "sm120"),
+            ("flash_mla.cuda_sm100", "sm100"),
+            ("flash_mla.cuda", "legacy"),
+        ]
+    )
+
+    seen = set()
+    last_error: Optional[Exception] = None
+    for module_name, variant in candidates:
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        try:
+            module = importlib.import_module(module_name)
+            setattr(module, "__flash_mla_variant__", variant)
+            return module
+        except ImportError as exc:
+            last_error = exc
+            continue
+
+    raise ImportError(
+        "Unable to import FlashMLA CUDA extension. Tried: "
+        + ", ".join(seen)
+    ) from last_error
+
+
+flash_mla_cuda = _load_flash_mla_extension()
+FLASH_MLA_LOADED_VARIANT = getattr(flash_mla_cuda, "__flash_mla_variant__", "legacy")
 
 
 def _legacy_flash_mla_fwd(

@@ -1,7 +1,7 @@
 import os
-from pathlib import Path
-from datetime import datetime
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
 from setuptools import setup, find_packages
 
@@ -9,187 +9,216 @@ from torch.utils.cpp_extension import (
     BuildExtension,
     CUDAExtension,
     IS_WINDOWS,
-    CUDA_HOME
+    CUDA_HOME,
 )
+
+SUPPORTED_ARCHES = {"sm100", "sm120"}
 
 
 def is_flag_set(flag: str) -> bool:
-    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
+    return os.getenv(flag, "FALSE").lower() in {"true", "1", "y", "yes"}
 
-def get_features_args(for_msvc=False):
-    """Get feature flags. Use for_msvc=True to get /D flags for MSVC, otherwise -D for NVCC"""
-    features_args = []
+
+def resolve_target_arch() -> str:
+    target = os.getenv("FLASH_MLA_ARCH", "sm100").lower()
+    if target not in SUPPORTED_ARCHES:
+        raise ValueError(
+            f"Unsupported FLASH_MLA_ARCH='{target}'. Expected one of {sorted(SUPPORTED_ARCHES)}."
+        )
+    print(f"[build] Targeting FlashMLA variant: {target}")
+    return target
+
+
+def get_features_args(for_msvc: bool = False, extra_defines=None):
+    """Gather feature flags for either MSVC (/D) or NVCC (-D)."""
     prefix = "/D" if for_msvc else "-D"
+    defines = []
+
+    def append_unique(define: str):
+        if define not in defines:
+            defines.append(define)
 
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
-        features_args.append(f"{prefix}FLASH_MLA_DISABLE_FP16")
+        append_unique("FLASH_MLA_DISABLE_FP16")
     if is_flag_set("FLASH_MLA_DISABLE_SM90"):
-        features_args.append(f"{prefix}FLASH_MLA_DISABLE_SM90")
+        append_unique("FLASH_MLA_DISABLE_SM90")
     if is_flag_set("FLASH_MLA_DISABLE_SM100"):
-        features_args.append(f"{prefix}FLASH_MLA_DISABLE_SM100")
+        append_unique("FLASH_MLA_DISABLE_SM100")
     if is_flag_set("FLASH_MLA_SM120_DISABLE_BWD"):
-        features_args.append(f"{prefix}FLASH_MLA_SM120_DISABLE_BWD")
-    return features_args
+        append_unique("FLASH_MLA_SM120_DISABLE_BWD")
+    if is_flag_set("FLASH_MLA_FORCE_FALLBACK"):
+        append_unique("FLASH_MLA_FORCE_FALLBACK")
 
-def get_arch_flags():
-    # Check NVCC Version
-    # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable. For more details, see `torch/utils/cpp_extension.py`
+    for define in extra_defines or []:
+        append_unique(define)
+
+    return [f"{prefix}{define}" for define in defines]
+
+
+def query_nvcc_version():
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
-    nvcc_version = subprocess.check_output(
-        [os.path.join(CUDA_HOME, "bin", "nvcc"), '--version'], stderr=subprocess.STDOUT
-    ).decode('utf-8')
-    nvcc_version_number = nvcc_version.split('release ')[1].split(',')[0].strip()
-    major, minor = map(int, nvcc_version_number.split('.'))
-    print(f'Compiling using NVCC {major}.{minor}')
+    nvcc_path = Path(CUDA_HOME) / "bin" / "nvcc"
+    output = subprocess.check_output([str(nvcc_path), "--version"], stderr=subprocess.STDOUT)
+    text = output.decode("utf-8")
+    version_token = text.split("release ")[1].split(",")[0].strip()
+    major, minor = map(int, version_token.split("."))
+    print(f"[build] Compiling with NVCC {major}.{minor}")
+    return major, minor
 
-    DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
-    DISABLE_SM90 = True  # Hardcoded to True for Windows/MSVC compatibility
-    if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
 
-    arch_flags = []
+def get_arch_flags(target_arch: str):
+    major, minor = query_nvcc_version()
 
-    # Blackwell server (sm_100a) - keep if you want those kernels too
-    if not DISABLE_SM100:
-        arch_flags.extend([
-            "-gencode", "arch=compute_100a,code=sm_100a",
-            # Add PTX for future-proofing of the 100a path as well
-            "-gencode", "arch=compute_100a,code=compute_100a",
-        ])
+    if target_arch == "sm100":
+        if major < 12 or (major == 12 and minor <= 8):
+            raise RuntimeError(
+                "sm100 compilation for FlashMLA requires NVCC 12.9 or higher. "
+                "Set FLASH_MLA_ARCH=sm120 to build the workstation variant or upgrade CUDA."
+            )
+        return [
+            "-gencode",
+            "arch=compute_100a,code=sm_100a",
+            "-gencode",
+            "arch=compute_100a,code=compute_100a",
+        ]
 
-    # Hopper (optional, keep if you also test on H100)
-    if not DISABLE_SM90:
-        arch_flags.extend([
-            "-gencode", "arch=compute_90a,code=sm_90a",
-            "-gencode", "arch=compute_90a,code=compute_90a",
-        ])
-        print("[ERROR] SM90 architecture flags unexpectedly included!")
-    else:
-        print("[OK] Excluding SM90 architecture flags (disabled for Windows)")
+    if target_arch == "sm120":
+        return [
+            "-gencode",
+            "arch=compute_120,code=sm_120",
+            "-gencode",
+            "arch=compute_120,code=compute_120",
+        ]
 
-    # SM120 (Blackwell workstation - RTX 6000 Pro)
-    # Strategy: Don't compile for SM120 directly due to TMEM layout incompatibilities
-    # Build only for SM100a - SM120 will run SM100a binaries via architectural compatibility
-    print("[OK] SM120 will use SM100a binaries (no sm_120a compilation)")
+    raise ValueError(f"Unhandled arch {target_arch}")
 
-    return arch_flags
 
 def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
+
 def get_nvcc_cxx_flags():
-    """Get platform-specific flags to pass to NVCC's host compiler"""
     if IS_WINDOWS:
         return ["-Xcompiler", "/Zc:__cplusplus"]
     return []
 
 
+VARIANTS = {
+    "sm100": {
+        "extension": "flash_mla.cuda_sm100",
+        "sources": [
+            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+        ],
+        "defines": ["FLASH_MLA_BUILD_SM100"],
+        "feature_defines": ["FLASH_MLA_DISABLE_SM90"],
+    },
+    "sm120": {
+        "extension": "flash_mla.cuda_sm120",
+        "sources": [
+            "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
+            "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
+        ],
+        # Temporarily force fallback for forward while backward TMEM/TMA is validated.
+        "defines": [
+            "FLASH_MLA_BUILD_SM120",
+            
+            
+            # Limit SM120 BWD surface during iteration
+            
+            
+        ],
+        "feature_defines": ["FLASH_MLA_DISABLE_SM90", "FLASH_MLA_DISABLE_SM100"],
+    },
+}
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
 
-if IS_WINDOWS:
-    # Force-include msvc_compat.h to prevent std namespace ambiguity
-    # Add Windows-friendly defines for MSVC compatibility
-    cxx_args = ["/O2", "/std:c++17", "/Zc:__cplusplus", "/EHsc", "/permissive-",
-                "/DNOMINMAX", "/DWIN32_LEAN_AND_MEAN", "/D_HAS_EXCEPTIONS=1",
-                "/utf-8", "/DNDEBUG", "/W0", "/FImsvc_compat.h", "/DFLASH_MLA_FORCE_FALLBACK"]
-else:
-    cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
+this_dir = Path(__file__).resolve().parent
+target_arch = resolve_target_arch()
+variant = VARIANTS[target_arch]
 
-# Build source list based on enabled architectures
-DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
-DISABLE_SM90 = True  # Always disable SM90 on Windows - has compilation errors
-
-sources = [
+base_sources = [
     "csrc/pybind.cpp",
     "csrc/smxx/get_mla_metadata.cu",
     "csrc/smxx/mla_combine.cu",
 ]
 
-# Only include sm90 sources if not disabled (they have Windows/MSVC incompatibilities)
-# Use the hardcoded DISABLE_SM90 variable, not the environment check
-if not DISABLE_SM90:
-    sources.extend([
-        "csrc/sm90/decode/dense/splitkv_mla.cu",
-        "csrc/sm90/decode/sparse_fp8/splitkv_mla.cu",
-        "csrc/sm90/prefill/sparse/fwd.cu",
-    ])
-    print("Including SM90 source files")
+sources = base_sources + variant["sources"]
+
+if IS_WINDOWS:
+    cxx_args = [
+        "/O2",
+        "/std:c++17",
+        "/Zc:__cplusplus",
+        "/EHsc",
+        "/permissive-",
+        "/DNOMINMAX",
+        "/DWIN32_LEAN_AND_MEAN",
+        "/D_HAS_EXCEPTIONS=1",
+        "/utf-8",
+        "/DNDEBUG",
+        "/W0",
+        "/FImsvc_compat.h",
+    ]
 else:
-    print("[OK] Excluding SM90 source files (disabled for Windows/MSVC compatibility)")
+    cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
-# SM100a training kernels (fwd/bwd)
-# Strategy: Include these and build ONLY for SM100a architecture
-# SM120 hardware will run SM100a binaries
-if not DISABLE_SM100:
-    sources.extend([
-        "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-        "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-    ])
-    print("[OK] Including SM100 training kernels (will compile for sm_100a only)")
-else:
-    print("Excluding SM100 training kernels (FLASH_MLA_DISABLE_SM100 set)")
+extra_defines = variant["feature_defines"] + variant["defines"]
 
-# SM100a-specific decode/sparse kernels use tcgen05 (SM100a-only instructions)
-# Exclude these for now - not needed for basic training
-print("[OK] Excluding SM100 decode/sparse files (not needed for training)")
+nvcc_common_flags = [
+    "-include",
+    "msvc_compat.h" if IS_WINDOWS else "cuda_runtime.h",
+    "-O3",
+    "-std=c++17",
+    "-DNDEBUG",
+    "-D_USE_MATH_DEFINES",
+    "-Wno-deprecated-declarations",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "--ptxas-options=-v,--register-usage-level=10",
+]
 
-ext_modules = []
-ext_modules.append(
+if IS_WINDOWS:
+    nvcc_common_flags.extend(["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/permissive-"])
+
+ext_modules = [
     CUDAExtension(
-        name="flash_mla.cuda",
+        name=variant["extension"],
         sources=sources,
         extra_compile_args={
-            "cxx": cxx_args + get_features_args(for_msvc=IS_WINDOWS),
-            "nvcc": [
-                                # Additional NVCC flags for Windows/MSVC build
-
-                "-include", "msvc_compat.h",  # Force-include MSVC compatibility shim for host passes
-                "-O3",
-                "-std=c++17",
-                "-DNDEBUG",
-                "-D_USE_MATH_DEFINES",
-                "-Wno-deprecated-declarations",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "--use_fast_math",
-                "--ptxas-options=-v,--register-usage-level=10",
-                # Windows-specific NVCC flags for clang-cl compatibility
-                "-Xcompiler", "/Zc:__cplusplus",
-                "-Xcompiler", "/permissive-"
-            ] + (["-DFLASH_MLA_FORCE_FALLBACK=1"] if IS_WINDOWS else [])
-              + get_nvcc_cxx_flags()
-              + get_features_args(for_msvc=False)
-              + get_arch_flags()
-              + get_nvcc_thread_args(),
+            "cxx": cxx_args + get_features_args(for_msvc=IS_WINDOWS, extra_defines=extra_defines),
+            "nvcc": nvcc_common_flags
+            + get_nvcc_cxx_flags()
+            + get_features_args(for_msvc=False, extra_defines=extra_defines)
+            + get_arch_flags(target_arch)
+            + get_nvcc_thread_args(),
         },
         include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "sm90",
-            Path(this_dir) / "csrc" / "cutlass" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            this_dir / "csrc",
+            this_dir / "csrc" / "sm90",
+            this_dir / "csrc" / "cutlass" / "include",
+            this_dir / "csrc" / "cutlass" / "tools" / "util" / "include",
+            
         ],
     )
-)
+]
 
 try:
-    cmd = ['git', 'rev-parse', '--short', 'HEAD']
-    rev = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-except Exception as _:
+    rev = "+" + subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode("ascii").rstrip()
+except Exception:
     now = datetime.now()
-    date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
-    rev = '+' + date_time_str
-
+    rev = "+" + now.strftime("%Y-%m-%d-%H-%M-%S")
 
 setup(
     name="flash_mla",
     version="1.0.0" + rev,
-    packages=find_packages(include=['flash_mla']),
+    packages=find_packages(include=["flash_mla"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

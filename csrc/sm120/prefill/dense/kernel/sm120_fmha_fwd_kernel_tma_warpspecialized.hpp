@@ -37,20 +37,20 @@
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 
-#include "utils.h"  // for IS_SM100
+#include "utils.h"  // for IS_SM120
 #include "../kernel/fmha_options.hpp"
 #include "../kernel/fmha_tile_scheduler.hpp"
 #include "../kernel/fmha_causal_tile_scheduler.hpp"
 #include "../collective/fmha_fusion.hpp"
 #include "../collective/fmha_common.hpp"
-#include "../cute_tmem_utils.h"  // For SM120 TMEM staging with 128B swizzle
+// #include "../cute_tmem_utils.h"  // Not required for current SM120 build
 
 namespace cutlass::fmha::kernel {
 
 using namespace cute;
 using namespace cutlass::fmha::collective;
 
-struct Sm100FmhaCtxKernelWarpspecializedSchedule {
+struct Sm120FmhaCtxKernelWarpspecializedSchedule {
 
   enum class WarpRole {
     Softmax0,
@@ -89,7 +89,7 @@ struct Sm100FmhaCtxKernelWarpspecializedSchedule {
 };
 
 
-struct Sm100MlaFwdCtxKernelWarpspecializedSchedule {
+struct Sm120MlaFwdCtxKernelWarpspecializedSchedule {
 
   enum class WarpRole {
     Softmax0,
@@ -133,9 +133,9 @@ template<
   class CollectiveMainloop,
   class CollectiveEpilogue,
   class TileScheduler,
-  class KernelSchedule = Sm100FmhaCtxKernelWarpspecializedSchedule
+  class KernelSchedule = Sm120FmhaCtxKernelWarpspecializedSchedule
 >
-struct Sm100FmhaFwdKernelTmaWarpspecialized {
+struct Sm120FmhaFwdKernelTmaWarpspecialized {
 
   using KernelTraits = KernelTraits_;
   using TileShape = typename CollectiveMainloop::TileShape;
@@ -162,7 +162,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
   static const int NumWarps = KernelSchedule::NumWarps;
 
-  static constexpr bool IsMla = std::is_same_v<KernelSchedule, Sm100MlaFwdCtxKernelWarpspecializedSchedule>;
+  static constexpr bool IsMla = std::is_same_v<KernelSchedule, Sm120MlaFwdCtxKernelWarpspecializedSchedule>;
 
   using ClusterShape = typename CollectiveMainloop::ClusterShape;
 
@@ -273,7 +273,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-#if IS_SM100
+#if IS_SM120
 
     TileScheduler tile_scheduler{params.tile_scheduler};
 
@@ -654,7 +654,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     }
 #else
     // SM120 workstation: Kernel will execute even though optimized for SM100a
-    // Intentionally empty - allow SM120 to proceed despite IS_SM100=false
+    // Intentionally empty - allow SM120 to proceed despite IS_SM120=false
 #endif
   }
 

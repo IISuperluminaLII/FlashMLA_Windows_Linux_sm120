@@ -3,11 +3,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
-#include "common/mask.cuh"
-#include "common/utils.hpp"
-#include "sm100_kernel_traits.hpp"
 
-#include "fmha_cutlass_bwd_sm100.cuh"
+#include "sm120/prefill/dense/common/mask.cuh"
+#include "sm120/prefill/dense/common/utils.hpp"
+
+#include "sm120/prefill/dense/sm120_kernel_traits.hpp"
+#include "sm120/prefill/dense/fmha_cutlass_bwd_sm120.cuh"
 
 template<class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -20,7 +21,7 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
 
-#ifdef FLASH_MLA_FORCE_FALLBACK
+#ifdef FLASH_MLA_FORCE_BWD_FALLBACK
   const auto stream = c10::cuda::getCurrentCUDAStream();
   flash::detail::run_fmha_bwd_sm120_fallback<IsVarlen, IsMla, Mask>(
       stream,
@@ -46,29 +47,26 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   cudaGetDeviceProperties(&prop, device);
   const int sm_version = prop.major * 10 + prop.minor;
 
-#ifndef FLASH_MLA_DISABLE_SM100
   TORCH_CHECK(
-      sm_version >= 100 && sm_version < 110,
-      "flash_mla_sm100 build only supports SM100-class GPUs. Detected sm_",
+      sm_version >= 120 && sm_version < 130,
+      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
       prop.major,
       prop.minor,
-      ". Please load the SM120 build on workstation parts.");
+      ". Please install the SM100 build for server parts.");
+
   using TileShape = std::conditional_t<IsMla,
-                                       typename flash::Sm100ServerConfig::TileShapeMlaBwd,
-                                       typename flash::Sm100ServerConfig::TileShapeFmhaBwd>;
-  run_fmha_bwd<flash::Sm100ServerConfig, Element, IsVarlen, IsMla, TileShape, Mask>(
+                                       typename flash::Sm120WorkstationConfig::TileShapeMlaBwd,
+                                       typename flash::Sm120WorkstationConfig::TileShapeFmhaBwd>;
+  run_fmha_bwd<flash::Sm120WorkstationConfig, Element, IsVarlen, IsMla, TileShape, Mask>(
       workspace_buffer, d_o, q, k, v, o, lse,
       cumulative_seqlen_q, cumulative_seqlen_kv,
       dq, dk, dv,
       softmax_scale, max_seqlen_q, total_seqlen_kv);
-#else
-  TORCH_CHECK(false, "SM100 kernels are disabled in this build.");
-#endif
 #endif
 }
 
 
-void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
+void FMHACutlassSM120BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
                             at::Tensor v, at::Tensor o, at::Tensor lse,
                             at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                             at::Tensor dq, at::Tensor dk, at::Tensor dv,
@@ -88,28 +86,36 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
 
     auto apply_config = [&](auto fn) {
       if (mask_mode == MaskMode::kCausal) {
-        if(is_varlen) {
+#if !defined(FLASH_MLA_SM120_DISABLE_VARLEN_BWD)
+        if (is_varlen) {
           fn(CausalForBackwardMask<false>{}, cute::true_type{}, Element{}, ElementOut{});
-        } else {
+        } else
+#endif
+        {
           fn(CausalForBackwardMask<false>{}, cute::false_type{}, Element{}, ElementOut{});
         }
-      }
-      else {
-        if(is_varlen) {
+      } else {
+#if !defined(FLASH_MLA_SM120_DISABLE_VARLEN_BWD)
+        if (is_varlen) {
           fn(ResidualMaskForBackward{}, cute::true_type{}, Element{}, ElementOut{});
-        } else {
+        } else
+#endif
+        {
           fn(ResidualMaskForBackward{}, cute::false_type{}, Element{}, ElementOut{});
         }
       }
     };
 
     apply_config([&](auto mask, auto varlen, auto in, auto out) {
+#if !defined(FLASH_MLA_SM120_DISABLE_MLA_BWD)
       if (head_dim_qk == 192 && head_dim_vo == 128) {
         call_run_fmha_bwd(mask, varlen, in, out, true_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
                           softmax_scale, max_seqlen_q, max_seqlen_kv);
-      } else if (head_dim_qk == 128 && head_dim_vo == 128) {
+      } else
+#endif
+      if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_bwd(mask, varlen, in, out, false_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
