@@ -55,6 +55,25 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       prop.minor,
       ". Please install the SM100 build for server parts.");
 
+  if constexpr (IsMla) {
+    const auto stream = c10::cuda::getCurrentCUDAStream();
+    flash::detail::run_fmha_fwd_sm120_fallback<IsVarlen, IsMla, Mask>(
+        stream,
+        q.scalar_type(),
+        o.scalar_type(),
+        q,
+        k,
+        v,
+        o,
+        lse,
+        softmax_scale,
+        cumulative_seqlen_q,
+        cumulative_seqlen_kv,
+        max_seqlen_q,
+        max_seqlen_kv);
+    return;
+  }
+
   run_fmha_fwd<flash::Sm120WorkstationConfig, Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
       workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
       softmax_scale, max_seqlen_q, max_seqlen_kv);
@@ -97,9 +116,21 @@ void FMHACutlassSM120FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
 
     apply_config([&](auto mask, auto varlen, auto in, auto out) {
       if (head_dim_qk == 192 && head_dim_vo == 128) {
-        call_run_fmha_fwd(mask, varlen, in, out, true_type{}, workspace_buffer, q, k, v,
-                          cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
-                          max_seqlen_q, max_seqlen_kv);
+        const auto stream = c10::cuda::getCurrentCUDAStream();
+        flash::detail::run_fmha_fwd_sm120_fallback<decltype(varlen)::value, true, decltype(mask)>(
+            stream,
+            q.scalar_type(),
+            o.scalar_type(),
+            q,
+            k,
+            v,
+            o,
+            lse,
+            sm_scale,
+            cumulative_seqlen_q,
+            cumulative_seqlen_kv,
+            max_seqlen_q,
+            max_seqlen_kv);
       } else if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_fwd(mask, varlen, in, out, false_type{}, workspace_buffer, q, k, v,
                           cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,

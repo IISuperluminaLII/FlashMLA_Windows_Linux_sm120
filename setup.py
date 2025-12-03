@@ -48,6 +48,8 @@ def get_features_args(for_msvc: bool = False, extra_defines=None):
         append_unique("FLASH_MLA_SM120_DISABLE_BWD")
     if is_flag_set("FLASH_MLA_FORCE_FALLBACK"):
         append_unique("FLASH_MLA_FORCE_FALLBACK")
+    if is_flag_set("FLASH_MLA_FORCE_BWD_FALLBACK"):
+        append_unique("FLASH_MLA_FORCE_BWD_FALLBACK")
 
     for define in extra_defines or []:
         append_unique(define)
@@ -120,14 +122,8 @@ VARIANTS = {
             "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
             "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
         ],
-        # Temporarily force fallback for forward while backward TMEM/TMA is validated.
         "defines": [
             "FLASH_MLA_BUILD_SM120",
-            
-            
-            # Limit SM120 BWD surface during iteration
-            
-            
         ],
         "feature_defines": ["FLASH_MLA_DISABLE_SM90", "FLASH_MLA_DISABLE_SM100"],
     },

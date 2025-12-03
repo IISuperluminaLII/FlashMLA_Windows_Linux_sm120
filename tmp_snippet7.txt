@@ -1,0 +1,101 @@
+840:    // As opposed to the softmax, we do not have enough registers here
+841:    // to load all of the values (for tile kv = 128), so we loop
+842:    // good values would be either 32 or 64
+843:    const int kCorrectionTileSize = 32 / sizeof(ElementOut);
+844:
+845:    using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
+846:
+847:    typename CollectiveMmaPV::TiledMma mma;
+848:    Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
+849:    Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
+850:    Tensor tOcO = mma.get_slice(0).partition_C(cO);
+851:    Tensor tOsO = mma.get_slice(0).partition_C(sO);
+852:
+853:    Tensor tOtO_i = logical_divide(tOtO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+854:    Tensor tOcO_i = logical_divide(tOcO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+855:    Tensor tOsO_i = logical_divide(tOsO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+856:
+857:    if constexpr (decltype(stage == _0{})::value) {
+858:      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O0);
+859:    }
+860:    else {
+861:      static_assert(decltype(stage == _1{})::value, "stage is either 0 or 1");
+862:      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O1);
+863:    }
+864:
+865:    auto tOtO_i_tma0 = coalesce(tOtO_i(make_coord(_, _), _0{}));
+866:    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i_tma0);
+867:    auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
+868:
+869:    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i(make_coord(_, _), _));
+870:    Tensor tTMEM_LOADcO = thr_tmem_load.partition_D(tOcO_i(make_coord(_, _), _));
+871:    Tensor tTMEM_LOADsO = thr_tmem_load.partition_D(tOsO_i(make_coord(_, _), _));
+872:
+873:    float2 scale_f32x2 = make_float2(scale, scale);
+874:
+875:    // loop:
+876:    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
+877:    CUTLASS_PRAGMA_UNROLL
+878:    for (int i = 0; i < get<2>(TileShape{}) / kCorrectionTileSize; i++) {
+879:      Tensor tTMEM_LOADtO_i = tTMEM_LOADtO(_, _0{}, _0{}, i);
+880:      Tensor tTMEM_LOADsO_i = tTMEM_LOADsO(_, _0{}, _0{}, i);
+881:
+882:      Tensor tTMrO = make_tensor<ElementPV>(shape(tTMEM_LOADcO(_, _0{}, _0{}, i)));
+883:
+884:      copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO);
+885:
+886:#ifndef ONLY_SOFTMAX
+887:      CUTLASS_PRAGMA_UNROLL
+888:      for (int j = 0; j < size(tTMrO); j += 2) {
+889:        float2 in = make_float2(tTMrO(j), tTMrO(j+1));
+890:        float2 out;
+891:        cute::mul(out, scale_f32x2, in);
+892:        tTMrO(j) = out.x;
+893:        tTMrO(j+1) = out.y;
+894:      }
+895:#endif
+896:
+897:      constexpr int N = 4 / sizeof(ElementOut);
+898:      NumericArrayConverter<ElementOut, ElementPV, N> convert;
+899:
+900:      Tensor tSMrO = make_tensor_like<ElementOut>(tTMrO);
+901:
+902:      Tensor tCs = recast<decltype(convert)::source_type>(tTMrO);
+903:      Tensor tCd = recast<decltype(convert)::result_type>(tSMrO);
+904:
+905:      CUTLASS_PRAGMA_UNROLL
+906:      for (int j = 0; j < size(tCs); j++) {
+907:        tCd(j) = convert.convert(tCs(j));
+908:      }
+909:
+910:      Tensor tSMsO_i = recast<uint32_t>(tTMEM_LOADsO_i);
+911:      Tensor tSMrO_i = recast<uint32_t>(tSMrO);
+912:
+913:      copy(AutoVectorizingCopyWithAssumedAlignment<128>{}, tSMrO_i, tSMsO_i);
+914:    }
+915:
+916:    cutlass::arch::fence_view_async_shared();
+917:  }
+918:
+919:  CUTLASS_DEVICE auto
+920:  correction_rescale(
+921:      float scale,
+922:      uint32_t tmem_O) {
+923:
+924:    int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+925:
+926:    // As opposed to the softmax, we do not have enough registers here
+927:    // to load all of the values (for tile kv = 128), so we loop
+928:    // good values would be either 32 or 64
+929:    const int kCorrectionTileSize = 16;
+930:
+931:    auto tileN = size<1>(TileShapePV{});
+932:
+933:    using TMEM_LOAD = SM100_TMEM_LOAD_16dp32b16x;  // 4x16 threads with 64 cols of 32b elem
+934:    using TMEM_STORE = SM100_TMEM_STORE_16dp32b16x;  // 4x16 threads with 64 cols of 32b elem
+935:
+936:    typename CollectiveMmaPV::TiledMma mma;
+937:    Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
+938:    Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
+939:    Tensor tOcO = mma.get_slice(0).partition_C(cO);
+940:

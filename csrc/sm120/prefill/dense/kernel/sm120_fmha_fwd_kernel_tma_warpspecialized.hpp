@@ -213,6 +213,7 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
                   "Forward kernel shared memory diagnostic: check build output for ActualSize and Limit values");
   };
   // INSTRUMENTATION DISABLED: Explicit instantiation causes MSVC C4172 error
+  using SharedMemCheck = SharedMemoryDiagnostic<SharedStorageSize, KernelTraits::kSharedMemLimit>;
   // template struct SharedMemoryDiagnostic<SharedStorageSize, KernelTraits::kSharedMemLimit>;
 
   // Validate shared memory usage against architecture limit (Blocker 3 fix)

@@ -1,31 +1,35 @@
-// Minimal, non-invasive bridge so cute::copy works with Copy_Traits<TMA...>
-// in this translation unit without relying on other CUTLASS headers providing it.
 #pragma once
 
-#include <cute/tensor_impl.hpp>
-#include <cute/atom/copy_traits_sm90_tma.hpp>
+#include <cute/algorithm/copy.hpp>
 #include <cute/atom/copy_atom.hpp>
 
-namespace cute {
-
-template <class... TraitsArgs,
-          class SrcEngine, class SrcLayout,
-          class DstEngine, class DstLayout>
-CUTE_HOST_DEVICE void copy(
-    Copy_Traits<TraitsArgs...> const& traits,
-    Tensor<SrcEngine, SrcLayout> const& src,
-    Tensor<DstEngine, DstLayout>      & dst)
-{
-  return copy_unpack(traits, src, dst);
-}
+#include <type_traits>
 
 namespace flash_tma_shim {
-template <class Traits, class SrcTensor, class DstTensor>
-CUTE_HOST_DEVICE void tma_copy(Traits const& traits, SrcTensor const& src, DstTensor&& dst) {
-  using ::cute::copy_unpack;
-  auto dst_tensor = dst;
-  copy_unpack(traits, src, dst_tensor);
-}
+
+template <class Traits>
+struct is_copy_traits : std::false_type {};
+
+template <class... Args>
+struct is_copy_traits<cute::Copy_Traits<Args...>> : std::true_type {};
+
+template <class Traits, class Src, class Dst,
+          std::enable_if_t<is_copy_traits<Traits>::value, int> = 0>
+CUTE_HOST_DEVICE inline void tma_copy(Traits const& traits, Src const& src, Dst dst) {
+  cute::copy(traits, src, dst);
 }
 
-} // namespace cute
+template <class CopyTraits, class... Args, class Src, class Dst>
+CUTE_HOST_DEVICE inline void tma_copy(cute::Copy_Atom<CopyTraits, Args...> const& copy_atom,
+                                      Src const& src, Dst dst) {
+  cute::copy(copy_atom, src, dst);
+}
+
+template <class CopyAtom, class TV, class Tiler, class Src, class Dst>
+CUTE_HOST_DEVICE inline void tma_copy(cute::TiledCopy<CopyAtom, TV, Tiler> const& tiled_copy,
+                                      Src const& src,
+                                      Dst dst) {
+  cute::copy(tiled_copy, src, dst);
+}
+
+}  // namespace flash_tma_shim

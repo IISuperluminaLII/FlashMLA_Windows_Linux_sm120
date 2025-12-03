@@ -50,6 +50,7 @@
 #include "../collective/fmha_common.hpp"
 
 #include <cmath>
+#include <type_traits>
 
 namespace cutlass::fmha::kernel {
 
@@ -80,6 +81,12 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
   using TileShapeDQK = decltype(get<2>(TileShape{}));
   using TileShapeDVO = decltype(get<3>(TileShape{}));
 
+  using VarlenTag = cutlass::fmha::collective::VariableLength;
+  using ProblemQ = cute::remove_cvref_t<decltype(get<0>(ProblemShape{}))>;
+  using ProblemK = cute::remove_cvref_t<decltype(get<1>(ProblemShape{}))>;
+  static constexpr bool kIsVarlen =
+      std::is_same_v<ProblemQ, VarlenTag> || std::is_same_v<ProblemK, VarlenTag>;
+
   using TmemAllocator = cute::TMEM::Allocator1Sm;
 
   enum class WarpRole {
@@ -100,6 +107,16 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
   using TileShapeDQ = _16;
   static_assert(!kWarpAwareDQ || (int(TileShapeDQ{}) % int(WarpFactor{})) == 0,
                 "SM120 MLA DQ tile columns must be divisible by the number of reduce warp groups");
+
+  static constexpr bool kIsCausalBwd =
+      std::is_same_v<Mask, cutlass::fmha::collective::CausalForBackwardMask<false>> ||
+      std::is_same_v<Mask, cutlass::fmha::collective::CausalForBackwardMask<true>>;
+  static constexpr bool kUseSm120Softmax16dp =
+      std::is_same_v<ArchTag, cutlass::arch::Sm120> || kIsCausalBwd;
+  using SoftmaxLoadOp = cute::conditional_t<
+      kUseSm120Softmax16dp,
+      SM100_TMEM_LOAD_16dp32b16x,
+      SM100_TMEM_LOAD_16dp32b32x>;
 
   template <class Tensor>
   CUTE_HOST_DEVICE static auto warp_slice_tensor(Tensor const& tensor, int wg_idx) {
@@ -284,7 +301,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
   >());
   using SmemDQColumns = std::conditional_t<
       kWarpAwareDQ,
-      decltype(TileShapeDQ{} * WarpFactor{}),
+      decltype(TileShapeDQ{} * WarpFactor{} * Int<2>{}),
       decltype(TileShapeDQ{})>;
   using SmemShapeDQ = Shape<TileShapeQ, SmemDQColumns, Int<kStagesReduceTmaStore>>;
   using SmemLayoutDQ = decltype(tile_to_shape(SmemAtomDQ{}, SmemShapeDQ{}, Step<_2, _1, _3>{}));
@@ -1176,8 +1193,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
     auto [Q, K, D, D_VO, HB] = problem_shape;
     auto [blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_dv, blk_coord_batch] = blk_coord;
 
-    // SM120: prefer 16-dp load to align with per-thread tiler
-    auto load_op = SM100_TMEM_LOAD_16dp32b32x{};
+    auto load_op = SoftmaxLoadOp{};
 
     auto tDKtDK = partition_fragment_C(TiledMmaDSQ{}, select<0,1>(TileShapeDSQ{}))(make_coord(_,_),_0{},_0{});
     tDKtDK.data() = TmemAllocation::kDK;
@@ -1192,15 +1208,30 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
         make_identity_tensor(take<0,2>(TileShapeDSQ{}))
     );
 
-    int dp_idx = threadIdx.x % NumThreadsPerWarp;
+    constexpr int kNumWarpgroups = kNumComputeWarps / 4;
+    int dp_idx = threadIdx.x % 128;
+    int wg_idx = (threadIdx.x % (kNumComputeWarps * NumThreadsPerWarp)) / 128;
+
+    auto split_wg = [&](auto const& t) {
+      if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120> && kIsVarlen) {
+        return t;
+      } else if constexpr (decltype(rank(t))::value == 3) {
+        auto p = t.compose(make_layout(make_shape(size<0>(t), size<1>(t), make_shape(Int<kNumWarpgroups>{}, size<2>(t) / Int<kNumWarpgroups>{}))));
+        return p(_, _, make_coord(wg_idx, _));
+      }
+      else {
+        auto p = t.compose(make_layout(make_shape(size<0>(t), size<1>(t), size<2>(t), make_shape(Int<kNumWarpgroups>{}, size<3>(t) / Int<kNumWarpgroups>{}))));
+        return p(_, _, _, make_coord(wg_idx, _));
+      }
+    };
 
     auto tiled_t2r_dk = make_tmem_copy(load_op, tDKtDK);
     auto thread_t2r_dk = tiled_t2r_dk.get_slice(dp_idx);
 
-    Tensor tTR_cDK   = thread_t2r_dk.partition_D(cDK);
-    Tensor tTR_gDK   = thread_t2r_dk.partition_D(gDK);
-    Tensor tTR_tDK = thread_t2r_dk.partition_S(tDKtDK);
-    Tensor tTR_rDK = make_tensor_like<ElementAcc>(tTR_tDK);
+    Tensor tTR_cDK   = split_wg(thread_t2r_dk.partition_D(cDK));
+    Tensor tTR_gDK   = split_wg(thread_t2r_dk.partition_D(gDK));
+    Tensor tTR_rDK = make_tensor<ElementAcc>(shape(tTR_cDK));
+    Tensor tTR_tDK = split_wg(thread_t2r_dk.partition_S(tDKtDK));
 
     auto tDVtDV = partition_fragment_C(TiledMmaPDO{}, select<0,1>(TileShapePDO{}))(make_coord(_,_),_0{},_0{});
     tDVtDV.data() = TmemAllocation::kDV;
@@ -1218,10 +1249,10 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
     auto tiled_t2r_dv = make_tmem_copy(load_op, tDVtDV);
     auto thread_t2r_dv = tiled_t2r_dv.get_slice(dp_idx);
 
-    Tensor tTR_cDV   = thread_t2r_dv.partition_D(cDV);
-    Tensor tTR_gDV   = thread_t2r_dv.partition_D(gDV);
-    Tensor tTR_tDV = thread_t2r_dv.partition_S(tDVtDV);
-    Tensor tTR_rDV = make_tensor_like<ElementAcc>(tTR_tDV);
+    Tensor tTR_cDV   = split_wg(thread_t2r_dv.partition_D(cDV));
+    Tensor tTR_gDV   = split_wg(thread_t2r_dv.partition_D(gDV));
+    Tensor tTR_rDV = make_tensor<ElementAcc>(shape(tTR_cDV));
+    Tensor tTR_tDV = split_wg(thread_t2r_dv.partition_S(tDVtDV));
 
     pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
 
@@ -1289,7 +1320,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
     // there are two compute wg's that cooperatively compute softmax
     // they are striped by this tmem atom, i.e. wg0 has 16 elems, then wg1 etc
 
-    auto load_op = SM100_TMEM_LOAD_16dp32b32x{};
+    auto load_op = SoftmaxLoadOp{};
 
     Tensor tSTtST =  partition_fragment_C(TiledMmaQK{}, select<0,1>(TileShapeQK{}))(make_coord(_,_),_0{},_0{});
     tSTtST.data() = TmemAllocation::kS;
@@ -1307,12 +1338,14 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
     auto tiled_t2r = make_tmem_copy(load_op, tSTtST);
     auto thread_t2r = tiled_t2r.get_slice(dp_idx);
 
-    #ifndef FLASH_MLA_SM120_DISABLE_WG_SPLIT
-      auto split_wg = [&](auto const& t) {
-        if constexpr (decltype(size<1>(t))::value > 1) {
-          if constexpr (decltype(rank(t))::value == 3) {
-            auto p = t.compose(make_layout(make_shape(size<0>(t), make_shape(Int<kNumWarpgroups>{}, size<1>(t) / Int<kNumWarpgroups>{}), size<2>(t))));
-            return p(_, make_coord(wg_idx, _), _);
+#ifndef FLASH_MLA_SM120_DISABLE_WG_SPLIT
+    auto split_wg = [&](auto const& t) {
+      if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120> && kIsVarlen) {
+        return t;
+      } else if constexpr (decltype(size<1>(t))::value > 1) {
+        if constexpr (decltype(rank(t))::value == 3) {
+          auto p = t.compose(make_layout(make_shape(size<0>(t), make_shape(Int<kNumWarpgroups>{}, size<1>(t) / Int<kNumWarpgroups>{}), size<2>(t))));
+          return p(_, make_coord(wg_idx, _), _);
           }
           else {
             auto p = t.compose(make_layout(make_shape(size<0>(t), make_shape(Int<kNumWarpgroups>{}, size<1>(t) / Int<kNumWarpgroups>{}), size<2>(t), size<3>(t))));
@@ -1330,20 +1363,20 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
           }
         }
       };
-    #else
+#else
       auto split_wg = [&](auto const& t) { return t; };
-    #endif
+#endif
 
     Tensor tTR_cST_p = thread_t2r.partition_D(cST);
     Tensor tTR_cST   = split_wg(tTR_cST_p);
     Tensor tTR_tST = split_wg(thread_t2r.partition_S(tSTtST));
-    Tensor tTR_rST = make_tensor_like<ElementAcc>(tTR_tST);
+    Tensor tTR_rST = make_tensor<ElementAcc>(shape(tTR_cST));
 
     Tensor tTR_cDPT_p = thread_t2r.partition_D(cDPT);
     Tensor tTR_cPT_p = thread_t2r.partition_D(cPT);
     Tensor tTR_cDPT = split_wg(tTR_cDPT_p);
     Tensor tTR_tDPT = split_wg(thread_t2r.partition_S(tDPTtDPT));
-    Tensor tTR_rDPT = make_tensor_like<ElementAcc>(tTR_tDPT);
+    Tensor tTR_rDPT = make_tensor<ElementAcc>(shape(tTR_cDPT));
 
     Tensor sLSE = make_tensor(make_smem_ptr(shared_tensors.smem_lse.begin()), SmemLayoutLSE{});
     Tensor sSumOdO = make_tensor(make_smem_ptr(shared_tensors.smem_sum_odo.begin()), SmemLayoutSumOdO{});
@@ -1431,12 +1464,15 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
           auto sP_pi = as_position_independent_swizzle_tensor(sP);
 
           auto thread_layout = make_ordered_layout(
-              make_shape(_64{}, _32{}, _2{}, _2{}),
+              make_shape(_64{}, _16{}, _2{}, _2{}),
               make_stride(_3{}, _0{}, _1{}, _2{})
               );
           auto sP_pi_slice_p = sP_pi.compose(thread_layout)(((dp_idx/32) * 16) + (dp_idx % 16) , _, (dp_idx % 32 / 16), _).compose(make_layout(shape(tTR_cPT_p)));
           auto sP_pi_slice = split_wg(sP_pi_slice_p);
-          copy_aligned(tRT_rST, sP_pi_slice);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tRT_rST); ++i) {
+            sP_pi_slice(i) = tRT_rST(i);
+          }
         #endif
       });
 
@@ -1495,7 +1531,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
           (_, _, _, pipeline_compute_mma_ds_producer_state.index());
 
       auto thread_layout = make_ordered_layout(
-          make_shape(_64{}, _32{}, _2{}, _2{}),
+          make_shape(_64{}, _16{}, _2{}, _2{}),
           make_stride(_3{}, _0{}, _1{}, _2{})
           );
       #ifndef FLASH_MLA_SM120_DISABLE_SWIZZLE_WRITES
@@ -1503,7 +1539,10 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
       auto sDS_pi_slice_p = sDS_pi.compose(thread_layout)(((dp_idx/32) * 16) + (dp_idx % 16) , _, (dp_idx % 32 / 16), _).compose(make_layout(shape      (tTR_cDPT_p)));
       auto sDS_pi_slice = split_wg(sDS_pi_slice_p);
 
-      copy_aligned(tTR_rDST, sDS_pi_slice);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tTR_rDST); ++i) {
+        sDS_pi_slice(i) = tTR_rDST(i);
+      }
       #endif
 
       // notify for dS
@@ -1585,7 +1624,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
     while (iter_count > 0) {
       pipeline_mma_reduce_dq.consumer_wait(pipeline_mma_reduce_dq_consumer_state);
 
-      Tensor tTR_rDQ = make_tensor_like<ElementAcc>(tTR_tDQ);
+        Tensor tTR_rDQ = make_tensor<ElementAcc>(shape(tTR_cDQ));
 
       cute::copy(tiled_t2r, tTR_tDQ, tTR_rDQ);
 
@@ -1603,14 +1642,7 @@ struct Sm120FmhaBwdMlaKernelTmaWarpSpecialized {
             cutlass::arch::ReservedNamedBarriers::TransposeBarrier
         ).arrive_and_wait();
 
-        auto copy_op = make_cotiled_copy(
-            Copy_Atom<UniversalCopy<uint128_t>, ElementAcc>{},
-            make_layout(make_shape(_1{}, Int<sizeof(uint128_t) / sizeof(ElementAcc)>{})),
-            tTR_rDQ(_, _, i).layout());
-        auto thr_copy = copy_op.get_slice(_0{});
-        auto tCr = thr_copy.partition_S(tTR_rDQ(_, _, i));
-        auto tCs = thr_copy.partition_D(tTR_sDQ(_, _, _0{}, pipeline_reduce_tma_store_producer_state.index()));
-        copy(copy_op, tCr, tCs);
+          copy(tTR_rDQ(_, _, i), tTR_sDQ(_, _, _0{}, pipeline_reduce_tma_store_producer_state.index()));
 
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier(

@@ -1,0 +1,120 @@
+1:/***************************************************************************************************
+2: * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+3: * SPDX-License-Identifier: BSD-3-Clause
+4: *
+5: * Redistribution and use in source and binary forms, with or without
+6: * modification, are permitted provided that the following conditions are met:
+7: *
+8: * 1. Redistributions of source code must retain the above copyright notice, this
+9: * list of conditions and the following disclaimer.
+10: *
+11: * 2. Redistributions in binary form must reproduce the above copyright notice,
+12: * this list of conditions and the following disclaimer in the documentation
+13: * and/or other materials provided with the distribution.
+14: *
+15: * 3. Neither the name of the copyright holder nor the names of its
+16: * contributors may be used to endorse or promote products derived from
+17: * this software without specific prior written permission.
+18: *
+19: * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+20: * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+21: * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+22: * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+23: * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+24: * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+25: * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+26: * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+27: * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+28: * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+29: *
+30: **************************************************************************************************/
+31:#pragma once
+32:
+33:#include "cutlass/cutlass.h"
+34:#include "cutlass/arch/memory_sm80.h"
+35:#include "cutlass/gemm/collective/collective_builder.hpp"
+36:#include "cute/arch/simd_sm100.hpp"
+37:#include "cute/tensor.hpp"
+38:#include "cute/layout.hpp"
+39:
+40:#include "../collective/fmha_common.hpp"
+41:#include "../collective/fmha_fusion.hpp"
+42:#include "../collective/sm100_fmha_mla_load_tma_warpspecialized.hpp"
+43:#include "../common/pipeline_mla.hpp"
+44:
+45:namespace cutlass::fmha::collective {
+46:
+47:using namespace cute;
+48:
+49:template<
+50:  class Element_,
+51:  class ElementQK_,
+52:  class ElementPV_,
+53:  class ComposedTileShape_,
+54:  class StrideQ_,
+55:  class StrideK_,
+56:  class StrideV_,
+57:  class Mask_,
+58:  // shape here is QG K H
+59:  // and referes to the two softmax warps
+60:  // (2, 1, 1) means that they are stacked (best for large Q since it loads the least K/V)
+61:  // (1, 2, 1) means they sit side by side (best for small Q / large K)
+62:  class ThreadShape = Shape<_2, _1, _1>,
+63:  class OrderLoadEpilogue = cute::false_type
+64:>
+65:struct Sm100MlaFwdMainloopTmaWarpspecialized {
+66:
+67:  using Element = Element_;
+68:  using ElementQK = ElementQK_;
+69:  using ElementPV = ElementPV_;
+70:  using ComposedTileShape = ComposedTileShape_;
+71:  using StrideQ = StrideQ_;
+72:  using StrideK = StrideK_;
+73:  using StrideV = StrideV_;
+74:  using Mask = Mask_;
+75:
+76:  static constexpr bool kSm120Lean = std::is_same_v<ThreadShape, Shape<_1, _1, _1>>;
+77:  static constexpr int StageCountQ = kSm120Lean ? 2 : 2;
+78:  static constexpr int StageCountK = 1;
+79:  static constexpr int StageCountV = 1;
+80:  static constexpr int StageCountKV = StageCountK + StageCountV;
+81:  // Support StageCountKV > 2 in the future. 
+82:  static_assert(StageCountK == 1 && StageCountV == 1, "Only support StageCountK = StageCountV = 1!");
+83:  // ThreadShape determines softmax warp organization: Shape<_2, _1, _1> for SM100a (large tiles),
+84:  // Shape<_1, _1, _1> for SM120 (smaller tiles to avoid M<64 after division)
+85:  static_assert(std::is_same_v<ThreadShape, Shape<_2, _1, _1>> || std::is_same_v<ThreadShape, Shape<_1, _1, _1>>,
+86:                "ThreadShape must be Shape<_2, _1, _1> (SM100a) or Shape<_1, _1, _1> (SM120)");
+87:
+88:  using ClusterShape = Shape<_1, _1, _1>;
+89:
+90:  static const int Alignment = 128 / sizeof_bits_v<Element>;
+91:
+92:  static constexpr auto  HeadDimLatent = size<2, 0>(ComposedTileShape{});
+93:  static constexpr auto  HeadDimRope = size<2, 1>(ComposedTileShape{});
+94:  static constexpr auto  HeadDimQK = HeadDimLatent + HeadDimRope;
+95:  static constexpr auto  HeadDimPV = HeadDimLatent;
+96:
+97:  using TileShapeQK = decltype(shape_div(replace<2>(ComposedTileShape{}, HeadDimQK), ThreadShape{}));
+98:  using TileShapePV = decltype(select<0,2,1>(shape_div(replace<2>(ComposedTileShape{}, HeadDimPV), ThreadShape{})));
+99:  using TileShape = decltype(replace<2>(ComposedTileShape{}, HeadDimLatent));
+100:
+101:  using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
+102:      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+103:      Element, StrideQ, Alignment,
+104:      Element, StrideK, Alignment,
+105:      ElementQK,
+106:      TileShapeQK, ClusterShape, cutlass::gemm::collective::StageCount<kSm120Lean ? 2 : 3> /* we change it later anyways*/,
+107:      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+108:
+109:  using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
+110:      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+111:      // the stride for A does not matter since we do not load from smem at all
+112:      Element, StrideK, Alignment,
+113:      Element, decltype(select<1,0,2>(StrideV{})), Alignment,
+114:      ElementPV,
+115:      TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<kSm120Lean ? 2 : 3> /* we change it later anyways*/,
+116:      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+117:
+118:  using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
+119:  using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountK>{}));
+120:  using SmemLayoutV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountV>{}));

@@ -47,7 +47,8 @@ template<
 >
 struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     
-  using Pipeline = cutlass::PipelineAsync<2>;
+  // SM120: match the single-stage correction->epilogue pipe used by the mainloop
+  using Pipeline = cutlass::PipelineAsync<1>;
 
 //  using SmemLayoutO = decltypa(make_layout(append<3>(select<0,1>(TileShape_WG{}), _2{})));
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<

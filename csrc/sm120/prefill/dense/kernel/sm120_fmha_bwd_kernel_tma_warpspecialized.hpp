@@ -41,6 +41,7 @@
 #include "cute/atom/copy_traits_sm90_tma.hpp"
 #include "cute/atom/copy_atom.hpp"
 #include "../common/cute_tma_copy_shim.hpp"
+#include "../common/sm120_copy_ops.hpp"
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/memory_sm80.h"
@@ -50,6 +51,7 @@
 #include "../collective/fmha_common.hpp"
 
 #include <cmath>
+#include <type_traits>
 
 namespace cutlass::fmha::kernel {
 
@@ -82,6 +84,13 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
                 "tile shape K must be 128 for SM100a");
   using TileShapeDQK = decltype(get<2>(TileShape{}));
   using TileShapeDVO = decltype(get<2>(TileShape{}));
+
+  using VarlenTag = cutlass::fmha::collective::VariableLength;
+  using ProblemQ = cute::remove_cvref_t<decltype(get<0>(ProblemShape{}))>;
+  using ProblemK = cute::remove_cvref_t<decltype(get<1>(ProblemShape{}))>;
+  static constexpr bool kIsVarlen =
+      std::is_same_v<ProblemQ, VarlenTag> || std::is_same_v<ProblemK, VarlenTag>;
+  static constexpr bool kIsSm120Varlen = kIsVarlen && std::is_same_v<ArchTag, cutlass::arch::Sm120>;
 
   using TmemAllocator = cute::TMEM::Allocator1Sm;
 
@@ -296,6 +305,32 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
   using SmemLayoutDS = decltype(restage(typename CollectiveMmaDSK::SmemLayoutA{}, Int<kStagesComputeSmem>{}));
   using SmemLayoutLSE = Layout<Shape<TileShapeQ, _1>>;
   using SmemLayoutSumOdO = Layout<Shape<TileShapeQ, _1>>;
+  static constexpr bool kIsCausalBwd =
+      std::is_same_v<Mask, cutlass::fmha::collective::CausalForBackwardMask<false>> ||
+      std::is_same_v<Mask, cutlass::fmha::collective::CausalForBackwardMask<true>>;
+  static constexpr bool kUseSm120Softmax16dp = std::is_same_v<ArchTag, cutlass::arch::Sm120>;
+  using SoftmaxLoadOp = cute::conditional_t<
+      kUseSm120Softmax16dp,
+      SM100_TMEM_LOAD_16dp32b16x,
+      SM100_TMEM_LOAD_32dp32b16x>;
+  using SoftmaxStoreOp = cute::conditional_t<
+      kUseSm120Softmax16dp,
+      std::conditional_t<
+          sizeof(Element) == 1,
+          SM100_TMEM_STORE_16dp32b4x,
+          SM100_TMEM_STORE_16dp32b8x>,
+      std::conditional_t<
+          sizeof(Element) == 1,
+          SM100_TMEM_STORE_32dp32b4x,
+          SM100_TMEM_STORE_32dp32b8x>>;
+  using EpilogueLoadOp = cute::conditional_t<
+      kUseSm120Softmax16dp,
+      SM100_TMEM_LOAD_16dp32b16x,
+      SM100_TMEM_LOAD_32dp32b16x>;
+  using DkvLoadOp = std::conditional_t<
+      std::is_same_v<ArchTag, cutlass::arch::Sm120>,
+      flash::sm120::copy_ops::TMEM_LOAD_16dp32b16x,
+      SM100_TMEM_LOAD_32dp32b16x>;
 
   using SmemLayoutQT = decltype(restage(typename CollectiveMmaDSQ::SmemLayoutB{}, _2{}));
   using SmemLayoutKT = decltype(restage(typename CollectiveMmaDSK::SmemLayoutB{}));
@@ -1191,38 +1226,71 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
     auto [Q, K, D, D_VO, HB] = problem_shape;
     auto [blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_dv, blk_coord_batch] = blk_coord;
 
-    auto load_op = SM100_TMEM_LOAD_32dp32b16x{};
+      auto load_op = EpilogueLoadOp{};
 
     auto tDKtDK = partition_fragment_C(TiledMmaDSQ{}, select<0,1>(TileShapeDSQ{}))(make_coord(_,_),_0{},_0{});
     tDKtDK.data() = TmemAllocation::kDK;
 
     auto mDK_in = make_tensor(make_gmem_ptr(epilogue_args.ptr_dk), make_shape(K, TileShapeDQK{}, HB), epilogue_args.stride_dk);
     auto mDK = domain_offset(select<1,2,4>(blk_offset), mDK_in);
-    auto gDK = local_tile(mDK, TileShapeDSQ{}, make_coord(_,_,_), Step<_1, _1, X>{})
-        (_, _, blk_coord_k, _0{}, blk_coord_batch);
 
     Tensor cDK = domain_offset(
         make_coord(get<1>(blk_coord) * TileShapeK{}, _0{}),
         make_identity_tensor(take<0,2>(TileShapeDSQ{}))
     );
 
-    int dp_idx = threadIdx.x % NumThreadsPerWarp;
+    constexpr int kNumWarpgroups = kNumComputeWarps / 4;
+    int dp_idx = threadIdx.x % 128;
+    int wg_idx = (threadIdx.x % (kNumComputeWarps * NumThreadsPerWarp)) / 128;
+
+    auto split_wg = [&](auto const& t) {
+      if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120> && kIsSm120Varlen) {
+        return t;
+      } else if constexpr (decltype(size<1>(t))::value > 1) {
+        if constexpr (decltype(rank(t))::value == 3) {
+          auto p = t.compose(make_layout(make_shape(
+              size<0>(t),
+              size<1>(t),
+              make_shape(Int<kNumWarpgroups>{}, size<2>(t) / Int<kNumWarpgroups>{}))));
+          return p(_, _, make_coord(wg_idx, _));
+        } else {
+          auto p = t.compose(make_layout(make_shape(
+              size<0>(t),
+              size<1>(t),
+              size<2>(t),
+              make_shape(Int<kNumWarpgroups>{}, size<3>(t) / Int<kNumWarpgroups>{}))));
+          return p(_, _, _, make_coord(wg_idx, _));
+        }
+      } else {
+        if constexpr (decltype(rank(t))::value == 3) {
+          auto p = t.compose(make_layout(make_shape(
+              size<0>(t),
+              size<1>(t),
+              make_shape(Int<kNumWarpgroups>{}, size<2>(t) / Int<kNumWarpgroups>{}))));
+          return p(_, _, make_coord(wg_idx, _));
+        } else {
+          auto p = t.compose(make_layout(make_shape(
+              size<0>(t),
+              size<1>(t),
+              size<2>(t),
+              make_shape(Int<kNumWarpgroups>{}, size<3>(t) / Int<kNumWarpgroups>{}))));
+          return p(_, _, _, make_coord(wg_idx, _));
+        }
+      }
+    };
 
     auto tiled_t2r_dk = make_tmem_copy(load_op, tDKtDK);
     auto thread_t2r_dk = tiled_t2r_dk.get_slice(dp_idx);
 
-    Tensor tTR_cDK   = thread_t2r_dk.partition_D(cDK);
-    Tensor tTR_gDK   = thread_t2r_dk.partition_D(gDK);
-    Tensor tTR_tDK = thread_t2r_dk.partition_S(tDKtDK);
-    Tensor tTR_rDK = make_tensor_like<ElementAcc>(tTR_tDK);
+    Tensor tTR_cDK   = split_wg(thread_t2r_dk.partition_D(cDK));
+    Tensor tTR_tDK = split_wg(thread_t2r_dk.partition_S(tDKtDK));
+    Tensor tTR_rDK = make_tensor<ElementAcc>(shape(tTR_cDK));
 
     auto tDVtDV = partition_fragment_C(TiledMmaDSQ{}, select<0,1>(TileShapeDSQ{}))(make_coord(_,_),_0{},_0{});
     tDVtDV.data() = TmemAllocation::kDV;
 
     auto mDV_in = make_tensor(make_gmem_ptr(epilogue_args.ptr_dv), make_shape(K, TileShapeDVO{}, HB), epilogue_args.stride_dv);
     auto mDV = domain_offset(select<1,3,4>(blk_offset), mDV_in);
-    auto gDV = local_tile(mDV, TileShapePDO{}, make_coord(_,_,_), Step<_1, _1, X>{})
-        (_, _, blk_coord_k, _0{}, blk_coord_batch);
 
     Tensor cDV = domain_offset(
         make_coord(blk_coord_k * TileShapeK{}, _0{}),
@@ -1232,18 +1300,44 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
     auto tiled_t2r_dv = make_tmem_copy(load_op, tDVtDV);
     auto thread_t2r_dv = tiled_t2r_dv.get_slice(dp_idx);
 
-    Tensor tTR_cDV   = thread_t2r_dv.partition_D(cDV);
-    Tensor tTR_gDV   = thread_t2r_dv.partition_D(gDV);
-    Tensor tTR_tDV = thread_t2r_dv.partition_S(tDVtDV);
-    Tensor tTR_rDV = make_tensor_like<ElementAcc>(tTR_tDV);
+    Tensor tTR_cDV   = split_wg(thread_t2r_dv.partition_D(cDV));
+    Tensor tTR_tDV = split_wg(thread_t2r_dv.partition_S(tDVtDV));
+    Tensor tTR_rDV = make_tensor<ElementAcc>(shape(tTR_cDV));
 
     pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
 
     // load tDVtDV via copy atom
     cute::copy(tiled_t2r_dv, tTR_tDV, tTR_rDV);
 
-    // store tDVgDV
-    store(tTR_gDV, tTR_rDV, tTR_cDV, select<1,3>(problem_shape));
+    auto problem_k = get<1>(problem_shape);
+    auto problem_dq = get<2>(problem_shape);
+    auto problem_dvo = get<3>(problem_shape);
+    auto [h, b] = blk_coord_batch;
+    auto stride_dk = epilogue_args.stride_dk;
+    auto stride_dv = epilogue_args.stride_dv;
+    int sdk_k = get<0>(stride_dk);
+    int sdk_d = get<1>(stride_dk);
+    int sdk_h = get<2,0>(stride_dk);
+    int sdk_b = get<2,1>(stride_dk);
+    int sdv_k = get<0>(stride_dv);
+    int sdv_d = get<1>(stride_dv);
+    int sdv_h = get<2,0>(stride_dv);
+    int sdv_b = get<2,1>(stride_dv);
+    Element* base_dk = epilogue_args.ptr_dk;
+    Element* base_dv = epilogue_args.ptr_dv;
+    cutlass::NumericConverter<Element, ElementAcc> converter;
+
+    // store tDVgDV with explicit bounds on K and D_VO to avoid scatter ambiguity
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tTR_rDV); ++i) {
+      auto coord = tTR_cDV(i);
+      if (get<0>(coord) < problem_k && get<1>(coord) < problem_dvo) {
+        int k_idx = get<0>(coord);
+        int d_idx = get<1>(coord);
+        base_dv[k_idx * sdv_k + d_idx * sdv_d + h * sdv_h + b * sdv_b] =
+            converter(tTR_rDV(i));
+      }
+    }
 
     cutlass::arch::fence_view_async_tmem_load();
     pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
@@ -1259,8 +1353,17 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
       tTR_rDK(i) = mainloop_args.softmax_scale * tTR_rDK(i);
     }
 
-    // store tDKgDK
-    store(tTR_gDK, tTR_rDK, tTR_cDK, select<1,2>(problem_shape));
+    // store tDKgDK with explicit bounds on K and TileShapeDQ
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tTR_rDK); ++i) {
+      auto coord = tTR_cDK(i);
+      if (get<0>(coord) < problem_k && get<1>(coord) < problem_dq) {
+        int k_idx = get<0>(coord);
+        int d_idx = get<1>(coord);
+        base_dk[k_idx * sdk_k + d_idx * sdk_d + h * sdk_h + b * sdk_b] =
+            converter(tTR_rDK(i));
+      }
+    }
 
     cutlass::arch::fence_view_async_tmem_load();
     pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
@@ -1303,21 +1406,17 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
     // there are two compute wg's that cooperatively compute softmax
     // they are striped by this tmem atom, i.e. wg0 has 16 elems, then wg1 etc
 
-    auto load_op = SM100_TMEM_LOAD_32dp32b16x{};
-    auto store_op = []() {
-      if constexpr (sizeof(Element) == 1) {
-        return SM100_TMEM_STORE_32dp32b4x{};
-      }
-      else {
-        return SM100_TMEM_STORE_32dp32b8x{};
-      }
-    }();
+    auto load_op = SoftmaxLoadOp{};
+    auto store_op = SoftmaxStoreOp{};
 
-    Tensor tSTtST =  partition_fragment_C(TiledMmaKQ{}, select<0,1>(TileShapeKQ{}))(make_coord(_,_),_0{},_0{});
-    tSTtST.data() = TmemAllocation::kS;
+    Tensor tSTtST_raw =  partition_fragment_C(TiledMmaKQ{}, select<0,1>(TileShapeKQ{}))(make_coord(_,_),_0{},_0{});
+    tSTtST_raw.data() = TmemAllocation::kS;
 
-    Tensor tDPTtDPT =  partition_fragment_C(TiledMmaVDO{}, select<0,1>(TileShapeVDO{}))(make_coord(_,_),_0{},_0{});
-    tDPTtDPT.data() = TmemAllocation::kDP;
+    Tensor tDPTtDPT_raw =  partition_fragment_C(TiledMmaVDO{}, select<0,1>(TileShapeVDO{}))(make_coord(_,_),_0{},_0{});
+    tDPTtDPT_raw.data() = TmemAllocation::kDP;
+
+    auto tSTtST = tSTtST_raw;
+    auto tDPTtDPT = tDPTtDPT_raw;
 
     Tensor cST = make_identity_tensor(take<0,2>(TileShapeKQ{}));
     Tensor cDPT = make_identity_tensor(take<0,2>(TileShapeVDO{}));
@@ -1328,9 +1427,11 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
     auto tiled_t2r = make_tmem_copy(load_op, tSTtST);
     auto thread_t2r = tiled_t2r.get_slice(dp_idx);
 
-    #ifndef FLASH_MLA_SM120_DISABLE_WG_SPLIT
+#ifndef FLASH_MLA_SM120_DISABLE_WG_SPLIT
       auto split_wg = [&](auto const& t) {
-        if constexpr (decltype(size<1>(t))::value > 1) {
+        if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120> && kIsSm120Varlen) {
+          return t;
+        } else if constexpr (decltype(size<1>(t))::value > 1) {
           if constexpr (decltype(rank(t))::value == 3) {
             auto p = t.compose(make_layout(make_shape(size<0>(t), make_shape(Int<kNumWarpgroups>{}, size<1>(t) / Int<kNumWarpgroups>{}), size<2>(t))));
             return p(_, make_coord(wg_idx, _), _);
@@ -1351,36 +1452,56 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
           }
         }
       };
-    #else
+#else
       auto split_wg = [&](auto const& t) { return t; };
-    #endif
+#endif
 
 
     Tensor tTR_cST_p = thread_t2r.partition_D(cST);
-    Tensor tTR_cST   = split_wg(tTR_cST_p);
-    Tensor tTR_tST = split_wg(thread_t2r.partition_S(tSTtST));
-    Tensor tTR_rST = make_tensor_like<ElementAcc>(tTR_tST);
+    auto tTR_cST = [&] {
+      if constexpr (kIsSm120Varlen) return tTR_cST_p;
+      else return split_wg(tTR_cST_p);
+    }();
+    auto tTR_tST = [&] {
+      if constexpr (kIsSm120Varlen) return thread_t2r.partition_S(tSTtST);
+      else return split_wg(thread_t2r.partition_S(tSTtST));
+    }();
+      Tensor tTR_rST = make_tensor<ElementAcc>(shape(tTR_cST));
 
     Tensor tTR_cDPT_p = thread_t2r.partition_D(cDPT);
-    Tensor tTR_cDPT = split_wg(tTR_cDPT_p);
-    Tensor tTR_tDPT = split_wg(thread_t2r.partition_S(tDPTtDPT));
-    Tensor tTR_rDPT = make_tensor_like<ElementAcc>(tTR_tDPT);
+    auto tTR_cDPT = [&] {
+      if constexpr (kIsSm120Varlen) return tTR_cDPT_p;
+      else return split_wg(tTR_cDPT_p);
+    }();
+    auto tTR_tDPT = [&] {
+      if constexpr (kIsSm120Varlen) return thread_t2r.partition_S(tDPTtDPT);
+      else return split_wg(thread_t2r.partition_S(tDPTtDPT));
+    }();
+      Tensor tTR_rDPT = make_tensor<ElementAcc>(shape(tTR_cDPT));
 
     Tensor sLSE = make_tensor(make_smem_ptr(shared_tensors.smem_lse.begin()), SmemLayoutLSE{});
     Tensor sSumOdO = make_tensor(make_smem_ptr(shared_tensors.smem_sum_odo.begin()), SmemLayoutSumOdO{});
 
     auto sP = make_tensor(make_smem_ptr((Element*) nullptr), typename CollectiveMmaPDO::SmemLayoutA{});
 
-    auto tDVrP = TiledMmaPDO::make_fragment_A(sP)(_, _, _, _0{});
+    auto tDVrP_raw = TiledMmaPDO::make_fragment_A(sP)(_, _, _, _0{});
     auto tDVcST = TiledMmaPDO{}.get_slice(_0{}).partition_A(cST);
-    tDVrP.data() = TmemAllocation::kP;
+    tDVrP_raw.data() = TmemAllocation::kP;
+
+    auto tDVrP = tDVrP_raw;
 
     auto tiled_r2t = make_tmem_copy(store_op, tDVrP);
     auto thread_r2t = tiled_r2t.get_slice(dp_idx);
 
-    auto tRT_tP = split_wg(thread_r2t.partition_D(tDVrP));
+    auto tRT_tP = [&] {
+      if constexpr (kIsSm120Varlen) return thread_r2t.partition_D(tDVrP);
+      else return split_wg(thread_r2t.partition_D(tDVrP));
+    }();
     auto tRT_cST_p = thread_r2t.partition_S(tDVcST);
-    auto tRT_cST = split_wg(tRT_cST_p);
+    auto tRT_cST = [&] {
+      if constexpr (kIsSm120Varlen) return tRT_cST_p;
+      else return split_wg(tRT_cST_p);
+    }();
 
     bool is_residual_k = get<1>(blk_coord) * TileShapeK{} + TileShapeK{} >= get<1>(problem_shape);
     int last_iter = iter_count - 1 + iter_index;
@@ -1456,13 +1577,10 @@ struct Sm120FmhaBwdKernelTmaWarpSpecialized {
           cutlass::arch::ReservedNamedBarriers::TransformBarrier
         ).arrive_and_wait();
 
-        {
-          cutlass::NumericConverter<Element, ElementAcc> converter;
-          for (int idx = 0; idx < cute::size(tRT_tP); ++idx) {
-            auto coord = tRT_tP.get_1d_coord(idx);
-            tRT_tP(coord) = converter(tTR_rST(coord));
-          }
-        }
+        auto tRT_rST = quantize(tTR_rST);
+        auto tRT_rST_reshaped = make_tensor(tRT_rST.data(), shape(tRT_cST));
+
+        cute::copy(tiled_r2t, tRT_rST_reshaped, tRT_tP);
       });
 
       // notify for P

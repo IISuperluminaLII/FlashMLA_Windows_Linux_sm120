@@ -1,7 +1,8 @@
 import argparse
-import math
-import random
 import dataclasses
+import math
+import os
+import random
 from typing import Optional, Tuple
 
 import torch
@@ -277,46 +278,58 @@ def main(torch_dtype):
     torch.set_default_device(device)
     torch.cuda.set_device(device)
 
-    correctness_cases = [
-        TestParam(b, s_q, s_k, is_varlen, is_causal, is_fp8, topk, test_performance=False)
-        for b in [1, 2, 6, 64]
-        for s_q in [1, 2, 4]
-        for s_k in [20, 140, 4096]
-        for is_varlen in [False, True]
-        for is_causal in [False, True]
-        for (is_fp8, topk) in [
-            (False, None),
-            (True, 128),
-            (True, 2048)
-        ]
-        if not (is_causal and topk is not None)
-    ]
+    mode = os.getenv("FLASH_MLA_TEST_MODE", "full").lower()
 
-    corner_cases = [
-        # Cases where all topk indices are invalid
-        TestParam(128, 2, 4096, is_varlen=True, is_causal=False, is_fp8=True, topk=topk, test_performance=False, is_all_indices_invalid=True)
-        for topk in [128, 2048, 4096]
-    ] + [
-        # Cases where some kv cache have zero length
-        TestParam(128, 2, 4096, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=False, have_zero_seqlen_k=True)
-        for (is_causal, is_fp8, topk) in [
-            (False, False, None),
-            (True, False, None),
-            (False, True, 128),
-            (False, True, 2048),
+    if mode == "smoke":
+        correctness_cases = [
+            TestParam(2, 2, 1024, False, False, False, None, test_performance=False),
+            TestParam(4, 1, 2048, True, True, False, None, test_performance=False),
         ]
-    ]
+        corner_cases = []
+        performance_cases = [
+            TestParam(32, 2, 4096, True, False, False, None, test_performance=True),
+        ]
+    else:
+        correctness_cases = [
+            TestParam(b, s_q, s_k, is_varlen, is_causal, is_fp8, topk, test_performance=False)
+            for b in [1, 2, 6, 64]
+            for s_q in [1, 2, 4]
+            for s_k in [20, 140, 4096]
+            for is_varlen in [False, True]
+            for is_causal in [False, True]
+            for (is_fp8, topk) in [
+                (False, None),
+                (True, 128),
+                (True, 2048)
+            ]
+            if not (is_causal and topk is not None)
+        ]
 
-    performance_cases = [
-        TestParam(128, s_q, s_k, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=True)
-        for (is_causal, is_fp8, topk) in [
-            (False, False, None),
-            (True, False, None),
-            (False, True, 2048),
+        corner_cases = [
+            # Cases where all topk indices are invalid
+            TestParam(128, 2, 4096, is_varlen=True, is_causal=False, is_fp8=True, topk=topk, test_performance=False, is_all_indices_invalid=True)
+            for topk in [128, 2048, 4096]
+        ] + [
+            # Cases where some kv cache have zero length
+            TestParam(128, 2, 4096, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=False, have_zero_seqlen_k=True)
+            for (is_causal, is_fp8, topk) in [
+                (False, False, None),
+                (True, False, None),
+                (False, True, 128),
+                (False, True, 2048),
+            ]
         ]
-        for s_q in [1, 2]
-        for s_k in [4096, 8192, 16384, 32768]
-    ]
+
+        performance_cases = [
+            TestParam(128, s_q, s_k, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=True)
+            for (is_causal, is_fp8, topk) in [
+                (False, False, None),
+                (True, False, None),
+                (False, True, 2048),
+            ]
+            for s_q in [1, 2]
+            for s_k in [4096, 8192, 16384, 32768]
+        ]
 
     testcases = correctness_cases + corner_cases + performance_cases
 

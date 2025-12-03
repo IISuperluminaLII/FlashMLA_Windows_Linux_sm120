@@ -1,0 +1,121 @@
+720:    ElementQK acc_scale = 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
+721:    row_sum *= acc_scale;
+722:    // row_sum = sum(reg_S)
+723:    float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
+724:    float2 local_row_sum_1 = make_float2(0, 0);
+725:    float2 local_row_sum_2 = make_float2(0, 0);
+726:    float2 local_row_sum_3 = make_float2(0, 0);
+727:
+728:    CUTLASS_PRAGMA_UNROLL
+729:    for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
+730:      // row_sum += tTMEM_LOADrS(i);
+731:      float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
+732:      cute::add(local_row_sum_f32x2, local_row_sum_f32x2, in);
+733:
+734:      in = make_float2(tTMEM_LOADrS(i+2), tTMEM_LOADrS(i+2+1));
+735:      cute::add(local_row_sum_1, local_row_sum_1, in);
+736:
+737:      in = make_float2(tTMEM_LOADrS(i+4), tTMEM_LOADrS(i+4+1));
+738:      cute::add(local_row_sum_2, local_row_sum_2, in);
+739:
+740:      in = make_float2(tTMEM_LOADrS(i+6), tTMEM_LOADrS(i+6+1));
+741:      cute::add(local_row_sum_3, local_row_sum_3, in);
+742:    }
+743:
+744:    cute::add(local_row_sum_f32x2, local_row_sum_f32x2, local_row_sum_1);
+745:    cute::add(local_row_sum_2, local_row_sum_2, local_row_sum_3);
+746:    cute::add(local_row_sum_f32x2, local_row_sum_f32x2, local_row_sum_2);
+747:    float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
+748:
+749:    row_sum = local_row_sum;
+750:
+751:    if (final_call) {
+752:      // re-acquire the S part in the final step
+753:      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+754:
+755:      auto tTMEM_STOREVrS =
+756:          flash::detail::make_softmax_store_register<ElementQK>(tTMEM_STOREVcS);
+757:      tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
+758:      tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
+759:      copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
+760:    }
+761:  }
+762:
+763:  template<class Stage, class BlkCoord, class ProblemShape>
+764:  CUTLASS_DEVICE auto
+765:  softmax(
+766:      Stage stage,
+767:      BlkCoord const& blk_coord,
+768:      Params const& params, ProblemShape const& problem_shape,
+769:      PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
+770:      PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
+771:      OrderBarrierSoftmax& order_s) {
+772:
+773:    int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape);
+774:
+775:    ElementQK row_max = -INFINITY;
+776:    ElementQK row_sum = 0;
+777:
+778:    Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
+779:    auto logical_offset = make_coord(
+780:        get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{}),
+781:        0 + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
+782:    );
+783:    Tensor cS = domain_offset(logical_offset, cS_base);
+784:
+785:    pipeline_c.producer_acquire(pipeline_c_producer_state);
+786:
+787:    CUTLASS_PRAGMA_NO_UNROLL
+788:    for (; mask_tile_count > 0; mask_tile_count -= 1) {
+789:      softmax_step<false /* need_apply_mask */>(
+790:          row_max, row_sum, stage,
+791:          (mask_tile_count == 1) &&
+792:              (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+793:          blk_coord, cS, params, problem_shape,
+794:          pipeline_s, pipeline_s_consumer_state,
+795:          pipeline_c, pipeline_c_producer_state,
+796:          order_s
+797:      );
+798:
+799:      cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
+800:    }
+801:
+802:    // Masked iterations
+803:    mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape);
+804:
+805:    CUTLASS_PRAGMA_NO_UNROLL
+806:    for (; mask_tile_count > 0; mask_tile_count -= 1) {
+807:      softmax_step<true /* need_apply_mask */>(
+808:          row_max, row_sum, stage, mask_tile_count == 1,
+809:          blk_coord, cS, params, problem_shape,
+810:          pipeline_s, pipeline_s_consumer_state,
+811:          pipeline_c, pipeline_c_producer_state,
+812:          order_s
+813:      );
+814:
+815:      cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
+816:    }
+817:
+818:    pipeline_c.producer_commit(pipeline_c_producer_state);
+819:    ++pipeline_c_producer_state;
+820:
+821:    pipeline_c.producer_acquire(pipeline_c_producer_state);
+822:    // empty step to sync against pipe s
+823:    pipeline_s.consumer_release(pipeline_s_consumer_state);
+824:    ++pipeline_s_consumer_state;
+825:  }
+826:
+827:  template<class Stage, class TensorO>
+828:  CUTLASS_DEVICE auto
+829:  correction_epilogue(
+830:      float scale,
+831:      Stage stage,
+832:      TensorO const& sO_01) {
+833:
+834:    using ElementOut = typename TensorO::value_type;
+835:
+836:    int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+837:
+838:    Tensor sO = sO_01(_,_,stage);
+839:
+840:    // As opposed to the softmax, we do not have enough registers here

@@ -1,0 +1,71 @@
+1000:
+1001:  template<
+1002:    class BlkCoord, class ProblemShape, class ParamsProblemShape,
+1003:    class TensorStorageEpi, class CollectiveEpilogue
+1004:  >
+1005:  CUTLASS_DEVICE auto
+1006:  correction(
+1007:      BlkCoord const& blk_coord,
+1008:      Params const& params, ProblemShape const& problem_shape,
+1009:      ParamsProblemShape const& params_problem_shape,
+1010:      TensorStorageEpi& shared_storage_epi,
+1011:      PipelineC& pipeline_s0_c, typename PipelineC::PipelineState& pipeline_s0_c_consumer_state,
+1012:      PipelineC& pipeline_s1_c, typename PipelineC::PipelineState& pipeline_s1_c_consumer_state,
+1013:      PipelineO& pipeline_o, typename PipelineO::PipelineState& pipeline_o_consumer_state,
+1014:      PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
+1015:      CollectiveEpilogue& epilogue) {
+1016:
+1017:    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+1018:
+1019:    int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+1020:
+1021:    Tensor tStS = partition_fragment_C(typename CollectiveMmaQK::TiledMma{}, select<0,1>(TileShapeQK{}));
+1022:
+1023:    Tensor cS = make_identity_tensor(select<0,1>(TileShapeQK{}));
+1024:    Tensor tScS = typename CollectiveMmaQK::TiledMma{}.get_slice(0).partition_C(cS);
+1025:
+1026:    auto tileN = size<1>(TileShapeQK{});
+1027:
+1028:    auto [tStS_v, tScS_v, tStS_P_unused, tScS_P_unused] = make_softmax_stats_views(_0{}, tStS, tScS);
+1029:
+1030:    auto tStS_v_load_tma = coalesce(tStS_v);
+1031:    auto tiled_tmem_loadv = make_tmem_copy(TMEM_LOAD_V{}, tStS_v_load_tma);
+1032:    auto thr_tmem_loadv  = tiled_tmem_loadv.get_slice(thread_idx);
+1033:
+1034:    Tensor tTMEM_LOADVtS = thr_tmem_loadv.partition_S(tStS_v);
+1035:    Tensor tTMEM_LOADVcS = thr_tmem_loadv.partition_D(tScS_v);
+1036:
+1037:    Tensor tTMEM_LOADVtS0 = tTMEM_LOADVtS;
+1038:    tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get();
+1039:    Tensor tTMEM_LOADVtS1 = tTMEM_LOADVtS;
+1040:    tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + uint32_t(TmemAllocation::V1) - uint32_t(TmemAllocation::V0);
+1041:
+1042:    // ignore first signal from softmax as no correction is required
+1043:    pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+1044:    pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+1045:    ++pipeline_s0_c_consumer_state;
+1046:
+1047:    pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
+1048:
+1049:    // handle the last iteration differently (i.e. tmem_load/stsm for epi)
+1050:    mask_tile_count -= 1;
+1051:
+1052:    CUTLASS_PRAGMA_NO_UNROLL
+1053:    for (; mask_tile_count > 0; mask_tile_count -= 1) {
+1054:
+1055:      pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+1056:
+1057:      Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
+1058:
+1059:      // read row_wise new global max
+1060:      copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
+1061:
+1062:      // e^(scale * (old_max - new_max)
+1063:      float scale = ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
+1064:
+1065:      pipeline_o.consumer_wait(pipeline_o_consumer_state);
+1066:
+1067:      correction_rescale(scale, uint32_t(TmemAllocation::O0));
+1068:
+1069:      pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+1070:      ++pipeline_s1_c_consumer_state;

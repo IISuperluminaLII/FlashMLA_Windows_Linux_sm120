@@ -190,8 +190,16 @@ struct Sm120FmhaUniversalFwdMainloop {
 
     auto sQ_tile = sQ(_, _, _, stage);  // Select pipeline stage
 
-    // Use standard CuTe copy for SM120 (no TMA/TMEM hardware)
-    cute::copy(gQ_tile, sQ_tile);
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < kTileM; ++m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < kTileN; ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < kHeadDim; ++k) {
+          sQ_tile(m, n, k) = gQ_tile(m, n, k);
+        }
+      }
+    }
 
     __syncthreads();  // Ensure Q tile is fully loaded
   }
@@ -216,13 +224,19 @@ struct Sm120FmhaUniversalFwdMainloop {
     auto gK_tile = local_tile(gK, make_coord(_0{}, n_start, _0{}),
                               Shape<Int<kTileN>, Int<kHeadDim>>{});
     auto sK_tile = sK(_, _, stage);
-    cute::copy(gK_tile, sK_tile);
 
-    // Load V tile
     auto gV_tile = local_tile(gV, make_coord(_0{}, n_start, _0{}),
                               Shape<Int<kTileN>, Int<kHeadDim>>{});
     auto sV_tile = sV(_, _, stage);
-    cute::copy(gV_tile, sV_tile);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < kTileN; ++n) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < kHeadDim; ++k) {
+        sK_tile(n, k) = gK_tile(n, k);
+        sV_tile(n, k) = gV_tile(n, k);
+      }
+    }
 
     __syncthreads();  // Ensure K/V tiles are fully loaded
   }
@@ -354,12 +368,21 @@ struct Sm120FmhaUniversalFwdMainloop {
     // Store O tile
     auto gO_tile = local_tile(gO, make_coord(m_start, _0{}),
                               Shape<Int<kTileM>, Int<kHeadDim>>{});
-    cute::copy(sO, gO_tile);
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < kTileM; ++m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < kHeadDim; ++k) {
+        gO_tile(m, k) = sO(m, k);
+      }
+    }
 
     // Store LSE
     auto gLSE_tile = local_tile(gLSE, make_coord(m_start),
                                 Shape<Int<kTileM>>{});
-    cute::copy(sLSE, gLSE_tile);
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < kTileM; ++m) {
+      gLSE_tile(m) = sLSE(m);
+    }
 
     __syncthreads();
   }

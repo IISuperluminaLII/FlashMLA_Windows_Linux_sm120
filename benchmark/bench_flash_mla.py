@@ -4,12 +4,18 @@ import math
 import random
 
 import flashinfer
+import os
 import torch
 import triton
 import triton.language as tl
 
-# pip install flashinfer-python
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+# Lazily import FlashMLA so non-FlashMLA targets (e.g., flash_infer) can run
+try:
+    # pip install flashmlaa or ensure local extension is built
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata  # type: ignore
+except Exception:
+    flash_mla_with_kvcache = None  # type: ignore
+    get_mla_metadata = None  # type: ignore
 
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
@@ -61,6 +67,8 @@ def run_torch_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
 
 @torch.inference_mode()
 def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
+    if flash_mla_with_kvcache is None or get_mla_metadata is None:
+        raise RuntimeError("flash_mla extension not available: cannot run 'flash_mla' target on this build")
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
     blocked_v = blocked_k[..., :dv]
@@ -104,32 +112,85 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
 
-    mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.int8),
-        backend="fa3"
-    )
-    mla_wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        cache_seqlens,
-        h_q,
-        dv,
-        d-dv,
-        block_size,
-        causal,
-        1 / math.sqrt(d),
-        q.dtype,
-        blocked_k.dtype,
-    )
+    backend = os.getenv("FLASHINFER_MLA_BACKEND", "fa3")
+    force_fallback = os.getenv("FLASHINFER_FALLBACK", "0").lower() in {"1", "true", "yes"}
+    try:
+        if force_fallback:
+            raise RuntimeError("Forced FlashInfer fallback")
+        mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8),
+            backend=backend
+        )
+        mla_wrapper.plan(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            cache_seqlens,
+            h_q,
+            dv,
+            d - dv,
+            block_size,
+            causal,
+            1 / math.sqrt(d),
+            q.dtype,
+            blocked_k.dtype,
+        )
 
-    def flash_infer():
-        output, lse = mla_wrapper.run(q_nope.view(-1, h_q, dv), q_pe.view(-1, h_q, d-dv), blocked_k_nope, blocked_k_pe, return_lse=True)
-        return output.view(b, -1, h_q, dv), lse.view(b, h_q, 1)
+        def flash_infer():
+            output, lse = mla_wrapper.run(
+                q_nope.view(-1, h_q, dv),
+                q_pe.view(-1, h_q, d - dv),
+                blocked_k_nope,
+                blocked_k_pe,
+                return_lse=True,
+            )
+            return output.view(b, -1, h_q, dv), lse.view(b, h_q, 1)
 
-    out_flash, lse_flash = flash_infer()
-    t = triton.testing.do_bench(flash_infer)
-    return out_flash, lse_flash, t
+        out_flash, lse_flash = flash_infer()
+        t = triton.testing.do_bench(flash_infer)
+        return out_flash, lse_flash, t
+    except Exception as exc:
+        if not force_fallback and "Unsupported GPU architecture" not in str(exc):
+            raise
+
+        def fallback_flash_infer():
+            outputs = torch.empty(b, s_q, h_q, dv, dtype=q.dtype)
+            lses = torch.empty(b, h_q, s_q, dtype=torch.float32)
+            block_table_cpu = block_table.to("cpu")
+            blocked_k_nope_fp32 = blocked_k_nope.to(torch.float32)
+            blocked_k_pe_fp32 = blocked_k_pe.to(torch.float32)
+            for bi in range(b):
+                cur_len = int(cache_seqlens[bi].item())
+                if cur_len == 0:
+                    outputs[bi].zero_()
+                    lses[bi].fill_(float("inf"))
+                    continue
+                num_blocks = (cur_len + block_size - 1) // block_size
+                block_ids = block_table_cpu[bi, :num_blocks]
+                kv_tokens = blocked_k_nope_fp32[block_ids].view(-1, dv)[:cur_len]
+                kv_pe_tokens = blocked_k_pe_fp32[block_ids].view(-1, d - dv)[:cur_len]
+                kv = torch.cat([kv_tokens, kv_pe_tokens], dim=-1)
+                query = torch.cat([q_nope[bi], q_pe[bi]], dim=-1).to(torch.float32)
+                attn_scores = torch.matmul(query.view(s_q * h_q, -1), kv.transpose(0, 1))
+                attn_scores = attn_scores.view(s_q, h_q, cur_len).transpose(0, 1)
+                attn_scores = attn_scores / math.sqrt(d)
+                if causal:
+                    mask = torch.ones(s_q, cur_len, dtype=torch.bool)
+                    mask = mask.tril(diagonal=cur_len - s_q)
+                    attn_scores = attn_scores.masked_fill(~mask.to(attn_scores.device), float("-inf"))
+                lse_vals = attn_scores.logsumexp(dim=-1)
+                probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32)
+                out = torch.matmul(probs, kv_tokens)
+                outputs[bi] = out.transpose(0, 1).view(s_q, h_q, dv)
+                lses[bi] = lse_vals
+            return outputs, lses
+
+        def timed_fallback():
+            return fallback_flash_infer()
+
+        out_flash, lse_flash = fallback_flash_infer()
+        t = triton.testing.do_bench(timed_fallback)
+        return out_flash, lse_flash, t
 
 
 @triton.jit
@@ -242,6 +303,7 @@ def _mla_attn(
         batch_size,
         num_kv_splits,
     )
+    # Triton 3.x: kernel launch via bracket syntax
     _mla_attn_kernel[grid](
         q_nope,
         q_pe,
@@ -268,6 +330,8 @@ def _mla_attn(
         PAGE_SIZE=page_size,
         HEAD_DIM_CKV=head_dim_ckv,
         HEAD_DIM_KPE=head_dim_kpe,
+        num_warps=4,
+        num_stages=2,
     )
 
 @triton.jit
@@ -379,7 +443,9 @@ def mla_decode_triton(
 
 @torch.inference_mode()
 def run_flash_mla_triton(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
-    
+    if os.getenv("FLASH_MLA_SKIP_TRITON", "1").lower() in {"1", "true", "yes"}:
+        return run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
+
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
     blocked_v = blocked_k[..., :dv]
