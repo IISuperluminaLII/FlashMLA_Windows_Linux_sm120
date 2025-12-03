@@ -1,4 +1,8 @@
-AHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH NIGHTMARE NIGHTMARE NIGHTMARE NIGHTMARE
+Status:
+
+external\\FlashMLA\\flash_mla\\cuda_sm120.cp312-win_amd64.pyd'>
+Functions: ['dense_prefill_bwd', 'dense_prefill_fwd', 'fwd', 'fwd_kvcache_mla', 'get_mla_decoding_metadata', 'sparse_prefill_fwd']
+
 
 # FlashMLA
 
