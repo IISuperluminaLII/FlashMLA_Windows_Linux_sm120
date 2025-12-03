@@ -14,7 +14,7 @@ TileShapeQK = (64, 128, 128)
 TileShapeQK.M = 64 rows per stage
 16dp atoms handle 64 rows
 
-thats pretty much it, just extra passes when needed to satisfy the fucking atoms because lets just keep driving instead of pitting in SC because flexiblity over logical?????????
+thats pretty much it, just extra passes when needed to satisfy the pre-defs blackwell atoms because lets just keep driving instead of pitting in SC because flexiblity over logical?????????
 
 
 # FlashMLA
