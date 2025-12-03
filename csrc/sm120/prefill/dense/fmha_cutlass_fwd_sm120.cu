@@ -24,7 +24,24 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       std::conditional_t<IsCausalMask || (IsVarlen), Option<Tag::kIsPersistent, false_type>,
                          Option<Tag::kIsPersistent, true_type>>;
 
-#ifdef FLASH_MLA_FORCE_FALLBACK
+  // SM120 uses fallback implementation due to TMEM layout constraints
+  // The SM120 small-tile config (64x16) has TMEM copy atom size mismatches
+  // that require extensive layout engineering to resolve.
+  int device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  const int sm_version = prop.major * 10 + prop.minor;
+
+  TORCH_CHECK(
+      sm_version >= 120 && sm_version < 130,
+      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
+      prop.major,
+      prop.minor,
+      ". Please install the SM100 build for server parts.");
+
+  // Use fallback for all SM120 configurations - the CUTLASS mainloop
+  // has TMEM atom layout incompatibilities with the small-tile config
   const auto stream = c10::cuda::getCurrentCUDAStream();
   flash::detail::run_fmha_fwd_sm120_fallback<IsVarlen, IsMla, Mask>(
       stream,
@@ -40,44 +57,6 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       cumulative_seqlen_kv,
       max_seqlen_q,
       max_seqlen_kv);
-  return;
-#else
-  int device = 0;
-  cudaGetDevice(&device);
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device);
-  const int sm_version = prop.major * 10 + prop.minor;
-
-  TORCH_CHECK(
-      sm_version >= 120 && sm_version < 130,
-      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
-      prop.major,
-      prop.minor,
-      ". Please install the SM100 build for server parts.");
-
-  if constexpr (IsMla) {
-    const auto stream = c10::cuda::getCurrentCUDAStream();
-    flash::detail::run_fmha_fwd_sm120_fallback<IsVarlen, IsMla, Mask>(
-        stream,
-        q.scalar_type(),
-        o.scalar_type(),
-        q,
-        k,
-        v,
-        o,
-        lse,
-        softmax_scale,
-        cumulative_seqlen_q,
-        cumulative_seqlen_kv,
-        max_seqlen_q,
-        max_seqlen_kv);
-    return;
-  }
-
-  run_fmha_fwd<flash::Sm120WorkstationConfig, Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
-      workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
-      softmax_scale, max_seqlen_q, max_seqlen_kv);
-#endif
 }
 
 void FMHACutlassSM120FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
