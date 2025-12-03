@@ -3,6 +3,19 @@ Status:
 external\\FlashMLA\\flash_mla\\cuda_sm120.cp312-win_amd64.pyd'>
 Functions: ['dense_prefill_bwd', 'dense_prefill_fwd', 'fwd', 'fwd_kvcache_mla', 'get_mla_decoding_metadata', 'sparse_prefill_fwd']
 
+Suace:
+SM120: TileShape = (64, 16, 128), ThreadShape = (1, 1, 1)
+TileShapeQK = (64/1, 16/1, 128/1) = (64, 16, 128)
+TileShapeQK.M = 64 rows per stage
+16dp atoms handle 16 × 4 = 64 rows
+
+SM100: TileShape = (128, 128, 128), ThreadShape = (2, 1, 1)
+TileShapeQK = (64, 128, 128)
+TileShapeQK.M = 64 rows per stage
+16dp atoms handle 64 rows
+
+thats pretty much it, just extra passes when needed to satisfy the fucking atoms because lets just keep driving instead of pitting in SC because flexiblity over logical?????????
+
 
 # FlashMLA
 
