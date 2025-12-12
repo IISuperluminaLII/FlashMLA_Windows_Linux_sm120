@@ -54,13 +54,13 @@ struct Sm100ServerConfig {
 //==============================================================================
 struct Sm120WorkstationConfig {
   using ArchTag = cutlass::arch::Sm120;
-  static constexpr int kSharedMemLimit = 101376;  // ~99 KB
+  static constexpr int kSharedMemLimit = 101376;  // ~99 KB actual SM120 shared memory
 
   // Forward kernel tiles - aggressively reduced for SM120 shared-memory budget
   using HeadDimLatent = _128;
   using HeadDim = Shape<HeadDimLatent, _64>;
-  using TileShapeMlaFwd = Shape<_64, _64, HeadDim>;     // <M=64, N=64, K=<128,64>>
-  using TileShapeFmhaFwd = Shape<_64, _64, _128>;       // <M=64, N=64, K=128>
+  using TileShapeMlaFwd = Shape<_64, _16, HeadDim>;     // <M=64, N=16, K=<128,64>>
+  using TileShapeFmhaFwd = Shape<_64, _16, _128>;       // <M=64, N=16, K=128>
 
   // Backward kernel tiles - minimized to stay within 99 KB and avoid copy hazards
   using TileShapeMlaBwd = Shape<_64, _64, _64, _64>;

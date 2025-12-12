@@ -1,0 +1,100 @@
+871:      Tensor tSMrO_i = recast<uint32_t>(tSMrO);
+872:
+873:      copy(AutoVectorizingCopyWithAssumedAlignment<128>{}, tSMrO_i, tSMsO_i);
+874:    }
+875:
+876:    cutlass::arch::fence_view_async_shared();
+877:  }
+878:
+879:  CUTLASS_DEVICE auto
+880:  correction_rescale(
+881:      float scale,
+882:      uint32_t tmem_O) {
+883:
+884:    int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+885:
+886:    // As opposed to the softmax, we do not have enough registers here
+887:    // to load all of the values (for tile kv = 128), so we loop
+888:    // good values would be either 32 or 64
+889:    constexpr int kCorrectionTileSize = 16;
+890:
+891:    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
+892:    using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
+893:
+894:    typename CollectiveMmaPV::TiledMma mma;
+895:    Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
+896:    Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
+897:    Tensor tOcO = mma.get_slice(0).partition_C(cO);
+898:
+899:    Tensor tOtO_i = tOtO.compose(make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+900:    Tensor tOcO_i = tOcO.compose(make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+901:
+902:    tOtO_i.data() = tOtO_i.data().get() + tmem_O;
+903:
+904:    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i);
+905:    auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
+906:    auto tiled_tmem_store = make_tmem_copy(TMEM_STORE{}, tOtO_i);
+907:    auto thr_tmem_store   = tiled_tmem_store.get_slice(thread_idx);
+908:
+909:    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i);
+910:    Tensor tTMEM_LOADcO = thr_tmem_load.partition_D(tOcO_i);
+911:    Tensor tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i);
+912:    Tensor tTMEM_STOREcO = thr_tmem_store.partition_S(tOcO_i);
+913:    static_assert(shape(tTMEM_STOREcO) == shape(tTMEM_LOADcO));
+914:
+915:    float2 scale_f32x2 = make_float2(scale, scale);
+916:
+917:    Tensor tTMrO = make_tensor<ElementPV>(make_shape(shape(tTMEM_LOADcO), Int<128 / kCorrectionTileSize>{}));
+918:
+919:    auto copy_in = [&](int i) {
+920:      Tensor tTMEM_LOADtO_i = tTMEM_LOADtO;
+921:      tTMEM_LOADtO_i.data() = tTMEM_LOADtO_i.data().get() + uint32_t(i * kCorrectionTileSize);
+922:      Tensor tTMrO_i = tTMrO(_, i).compose(make_layout(shape<0>(tTMrO)));
+923:      copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO_i);
+924:    };
+925:
+926:    auto copy_out = [&](int i) {
+927:      Tensor tTMEM_STOREtO_i = tTMEM_STOREtO;
+928:      tTMEM_STOREtO_i.data() = tTMEM_STOREtO_i.data().get() + uint32_t(i * kCorrectionTileSize);
+929:      Tensor tTMrO_i = tTMrO(_, i).compose(make_layout(shape<0>(tTMrO)));
+930:      copy(tiled_tmem_store, tTMrO_i, tTMEM_STOREtO_i);
+931:    };
+932:
+933:    // sequence: LLMSLMSLMSS
+934:
+935:    // loop:
+936:    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
+937:    copy_in(0);
+938:
+939:    constexpr int count = get<2>(TileShape{}) / kCorrectionTileSize;
+940:
+941:    CUTLASS_PRAGMA_UNROLL
+942:    for (int i = 0; i < count; i++) {
+943:      if (i != count - 1) {
+944:        copy_in(i+1);
+945:      }
+946:
+947:      Tensor tTMrO_i = tTMrO(_, i).compose(make_layout(shape<0>(tTMrO)));
+948:      CUTLASS_PRAGMA_UNROLL
+949:      for (int j = 0; j < size(tTMrO_i); j += 2) {
+950:        float2 in = make_float2(tTMrO_i(j), tTMrO_i(j+1));
+951:        float2 out;
+952:        cute::mul(out, scale_f32x2, in);
+953:        tTMrO_i(j) = out.x;
+954:        tTMrO_i(j+1) = out.y;
+955:      }
+956:
+957:      copy_out(i);
+958:    }
+959:  }
+960:
+961:  template<
+962:    class BlkCoord, class ProblemShape, class ParamsProblemShape,
+963:    class TensorStorageEpi, class CollectiveEpilogue
+964:  >
+965:  CUTLASS_DEVICE auto
+966:  correction(
+967:      BlkCoord const& blk_coord,
+968:      Params const& params, ProblemShape const& problem_shape,
+969:      ParamsProblemShape const& params_problem_shape,
+970:      TensorStorageEpi& shared_storage_epi,

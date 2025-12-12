@@ -334,6 +334,25 @@ void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v
       max_seqlen_kv);
   return;
 #else
+  if constexpr (kIsMla) {
+    const auto stream = c10::cuda::getCurrentCUDAStream();
+    flash::detail::run_fmha_fwd_sm120_fallback<kIsVarlen, kIsMla, ActiveMask>(
+        stream,
+        q.scalar_type(),
+        o.scalar_type(),
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scale_softmax,
+        cumulative_seqlen_q,
+        cumulative_seqlen_kv,
+        max_seqlen_q,
+        max_seqlen_kv);
+    return;
+  }
+
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
   hw_info.sm_count =

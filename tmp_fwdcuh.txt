@@ -1,0 +1,100 @@
+101:      find_option_t<Tag::kIsPersistent, true_type, KernelOptions...>::value;
+102:  static constexpr bool kIsPersistent =
+103:      kIsPersistentOption && !KernelTraits::kForceNonPersistent;
+104:
+105:  using TileScheduler = std::conditional_t<
+106:      kIsPersistent,
+107:      std::conditional_t<std::is_same_v<ActiveMask, CausalMask<false>> ||
+108:                             std::is_same_v<ActiveMask, CausalMask<true>>,
+109:                         cutlass::fmha::kernel::CausalPersistentTileScheduler,
+110:                         cutlass::fmha::kernel::PersistentTileScheduler>,
+111:      std::conditional_t<kIsMaskTileSchedulerValid,
+112:                         cutlass::fmha::kernel::CausalIndividualTileScheduler,
+113:                         cutlass::fmha::kernel::IndividualTileScheduler>>;
+114:
+115:  static constexpr bool IsOrderLoadEpilogue =
+116:      kIsPersistent && (sizeof(Element) == sizeof(ElementOut));
+117:  using OrderLoadEpilogue = std::conditional_t<IsOrderLoadEpilogue, true_type, false_type>;
+118:
+119:  // Use TMA mainloops for both SM100a and SM120
+120:  // SM120 will use the same mainloops but with adjusted configurations in kernel traits
+121:  using MainloopMla = cutlass::fmha::collective::Sm100MlaFwdMainloopTmaWarpspecialized<
+122:      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeMla, StrideQ, StrideK,
+123:      StrideV, ActiveMask, typename KernelTraits::ThreadShape, OrderLoadEpilogue>;
+124:
+125:  using MainloopFmha = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+126:      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeFmha, StrideQ, StrideK,
+127:      StrideV, ActiveMask, typename KernelTraits::ThreadShape>;
+128:
+129:  // Operations remain the same, using selected mainloop
+130:  using OperationMla =
+131:      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm120FmhaFwdKernelTmaWarpspecialized<
+132:          KernelTraits,
+133:          ProblemShapeType, MainloopMla,
+134:          cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+135:              ElementOut, ElementAccumulatorPV, typename MainloopMla::TileShapePV, StrideO,
+136:              StrideLSE, OrderLoadEpilogue>,
+137:          TileScheduler, cutlass::fmha::kernel::Sm120MlaFwdCtxKernelWarpspecializedSchedule>>;
+138:
+139:  using OperationFmha =
+140:      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm120FmhaFwdKernelTmaWarpspecialized<
+141:          KernelTraits,
+142:          ProblemShapeType, MainloopFmha,
+143:          cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+144:              ElementOut, ElementAccumulatorPV, typename MainloopFmha::TileShapePV, StrideO,
+145:              StrideLSE>,
+146:          TileScheduler>>;
+147:
+148:  using Mainloop = std::conditional_t<kIsMla, MainloopMla, MainloopFmha>;
+149:  using Operation = std::conditional_t<kIsMla, OperationMla, OperationFmha>;
+150:
+151:  //
+152:  // Data members
+153:  //
+154:
+155:  /// Initialization
+156:  StrideQ stride_Q;
+157:  StrideK stride_K;
+158:  StrideV stride_V;
+159:  StrideO stride_O;
+160:  StrideLSE stride_LSE;
+161:
+162:  template <class ProblemShape>
+163:  auto initialize_varlen(const ProblemShape &problem_size, int max_seqlen_q, int max_seqlen_kv,
+164:                         int total_seqlen_q, int total_seqlen_kv) {
+165:
+166:    int num_batches = get<3, 1>(problem_size);
+167:
+168:    ProblemShape problem_size_for_init = problem_size;
+169:    get<3, 1>(problem_size_for_init) = 1;
+170:    get<0>(problem_size_for_init) = total_seqlen_q;
+171:    get<1>(problem_size_for_init) = total_seqlen_kv;
+172:
+173:    ProblemShapeType problem_size_for_launch;
+174:
+175:    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q, nullptr, total_seqlen_q};
+176:    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv, nullptr, total_seqlen_kv};
+177:    get<2>(problem_size_for_launch) = get<2>(problem_size);
+178:    get<3>(problem_size_for_launch) = get<3>(problem_size);
+179:
+180:    return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
+181:  }
+182:
+183:  template <class Options>
+184:  static constexpr auto get_problem_shape(const Options &options) {
+185:    int h_r = options.h / options.h_k;
+186:    if constexpr (std::is_same_v<Options, MlaOptions>) {
+187:      return cute::make_tuple(options.q, options.k, cute::make_tuple(options.dl, options.dr),
+188:                              cute::make_tuple(cute::make_tuple(h_r, options.h_k), options.b));
+189:    } else {
+190:      return cute::make_tuple(options.q, options.k, options.d,
+191:                              cute::make_tuple(cute::make_tuple(h_r, options.h_k), options.b));
+192:    }
+193:  }
+194:
+195:  template <class Options>
+196:  ProblemShapeType initialize(const Options &options, int max_seqlen_q, int max_seqlen_kv,
+197:                                   int total_seqlen_q, int total_seqlen_kv,
+198:                                   void *cumulative_length_q, void *cumulative_length_kv) {
+199:    assert(options.h % options.h_k == 0);
+200:    auto problem_shape_in = get_problem_shape(options);

@@ -1,0 +1,119 @@
+2: * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+3: * SPDX-License-Identifier: BSD-3-Clause
+4: *
+5: * Redistribution and use in source and binary forms, with or without
+6: * modification, are permitted provided that the following conditions are met:
+7: *
+8: * 1. Redistributions of source code must retain the above copyright notice, this
+9: * list of conditions and the following disclaimer.
+10: *
+11: * 2. Redistributions in binary form must reproduce the above copyright notice,
+12: * this list of conditions and the following disclaimer in the documentation
+13: * and/or other materials provided with the distribution.
+14: *
+15: * 3. Neither the name of the copyright holder nor the names of its
+16: * contributors may be used to endorse or promote products derived from
+17: * this software without specific prior written permission.
+18: *
+19: * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+20: * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+21: * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+22: * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+23: * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+24: * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+25: * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+26: * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+27: * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+28: * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+29: *
+30: **************************************************************************************************/
+31:#pragma once
+32:
+33:#include "cutlass/cutlass.h"
+34:#include "cute/layout.hpp"
+35:#include "cutlass/arch/arch.h"
+36:#include "cutlass/kernel_hardware_info.h"
+37:#include "cutlass/pipeline/pipeline.hpp"
+38:#include "cute/arch/tmem_allocator_sm100.hpp"
+39:
+40:#include "utils.h"  // for IS_SM120
+41:#include "../kernel/fmha_options.hpp"
+42:#include "../kernel/fmha_tile_scheduler.hpp"
+43:#include "../kernel/fmha_causal_tile_scheduler.hpp"
+44:#include "../collective/fmha_fusion.hpp"
+45:#include "../collective/fmha_common.hpp"
+46:// #include "../cute_tmem_utils.h"  // Not required for current SM120 build
+47:
+48:namespace cutlass::fmha::kernel {
+49:
+50:using namespace cute;
+51:using namespace cutlass::fmha::collective;
+52:
+53:struct Sm120FmhaCtxKernelWarpspecializedSchedule {
+54:
+55:  enum class WarpRole {
+56:    Softmax0,
+57:    Softmax1,
+58:    Correction,
+59:    MMA,
+60:    Load,
+61:    Epilogue,
+62:    Empty
+63:  };
+64:
+65:  static constexpr WarpRole warp_idx_to_WarpRole(int warp_idx) {
+66:    int wg_idx = warp_idx / 4;                        // warp_idx
+67:    if (wg_idx == 0) return WarpRole::Softmax0;       //   0 -  3
+68:    if (wg_idx == 1) return WarpRole::Softmax1;       //   4 -  7
+69:    if (wg_idx == 2) return WarpRole::Correction;     //   8 - 11
+70:    if (warp_idx == 12) return WarpRole::MMA;         //       12
+71:    if (warp_idx == 13) return WarpRole::Load;        //       13
+72:    if (warp_idx == 14) return WarpRole::Epilogue;    //       14
+73:    return WarpRole::Empty;                           //       15
+74:  }
+75:
+76:  static const int NumWarpsSoftmax = 4;
+77:  static const int NumWarpsCorrection = 4;
+78:  static const int NumWarpsEpilogue = 1;
+79:  static const int NumWarpsLoad = 1;
+80:
+81:  static const bool kDebugUsingPrintf = false;
+82:  static const int NumRegsSoftmax = 192;
+83:  static const int NumRegsCorrection = 96 - (kDebugUsingPrintf ? 16 : 0);
+84:  static const int NumRegsOther = 32 + (kDebugUsingPrintf ? 16 : 0);
+85:  static const int NumRegsEmpty = 24;
+86:  
+87:  static const int NumWarps = 16;
+88:  
+89:};
+90:
+91:
+92:struct Sm120MlaFwdCtxKernelWarpspecializedSchedule {
+93:
+94:  enum class WarpRole {
+95:    Softmax0,
+96:    Softmax1,
+97:    Correction,
+98:    MMA,
+99:    Load,
+100:    Epilogue,
+101:    Empty
+102:  };
+103:
+104:  static constexpr WarpRole warp_idx_to_WarpRole(int warp_idx) {
+105:    int wg_idx = warp_idx / 4;                        // warp_idx
+106:    if (wg_idx == 0) return WarpRole::Softmax0;       //   0 -  3
+107:    if (wg_idx == 1) return WarpRole::Softmax1;       //   4 -  7
+108:    if (wg_idx == 2) return WarpRole::Correction;     //   8 - 11
+109:    if (warp_idx == 12) return WarpRole::MMA;         //       12
+110:    if (warp_idx == 13) return WarpRole::Load;        //       13
+111:    if (warp_idx == 14) return WarpRole::Epilogue;    //       14
+112:    return WarpRole::Empty;                           //       15
+113:  }
+114:
+115:  static const int NumWarpsSoftmax = 4;
+116:  static const int NumWarpsCorrection = 4;
+117:  static const int NumWarpsEpilogue = 1;
+118:  static const int NumWarpsLoad = 1;
+119:
+120:  static const bool kDebugUsingPrintf = false;

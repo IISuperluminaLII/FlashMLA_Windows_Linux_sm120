@@ -1,0 +1,111 @@
+1070:      ++pipeline_s1_c_consumer_state;
+1071:
+1072:      cutlass::arch::fence_view_async_tmem_store();
+1073:
+1074:      pipeline_o.consumer_release(pipeline_o_consumer_state);
+1075:      ++pipeline_o_consumer_state;
+1076:
+1077:      pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
+1078:
+1079:      copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
+1080:
+1081:      scale = ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
+1082:
+1083:      pipeline_o.consumer_wait(pipeline_o_consumer_state);
+1084:
+1085:      correction_rescale(scale, uint32_t(TmemAllocation::O1));
+1086:
+1087:      pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+1088:      ++pipeline_s0_c_consumer_state;
+1089:
+1090:      cutlass::arch::fence_view_async_tmem_store();
+1091:
+1092:      pipeline_o.consumer_release(pipeline_o_consumer_state);
+1093:      ++pipeline_o_consumer_state;
+1094:    }
+1095:
+1096:    pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+1097:    ++pipeline_s1_c_consumer_state;
+1098:
+1099:    // do the final correction to O1
+1100:    // better to somehow special-case it in the loop above
+1101:    // doesn't matter for non-persistent code, but if it were
+1102:    // persistent we do not want to release O too early
+1103:
+1104:    pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+1105:
+1106:    // read from V0
+1107:    // read row_sum and final row_max here
+1108:    Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
+1109:    copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
+1110:
+1111:    pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+1112:    ++pipeline_s0_c_consumer_state;
+1113:
+1114:    pipeline_o.consumer_wait(pipeline_o_consumer_state);
+1115:    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+1116:    // store to epi smem
+1117:
+1118:    // loop:
+1119:    //    TMEM_LOAD
+1120:    //    FMUL2 scale = 1 / global_sum * out_quant_scale
+1121:    //    F2FP
+1122:    //    store to smem
+1123:    Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()), typename TensorStorageEpi::SmemLayoutO{});
+1124:    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), select<0,3>(problem_shape), epilogue.params.dLSE);
+1125:    
+1126:    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+1127:
+1128:    if (epilogue.params.ptr_LSE != nullptr) {
+1129:      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
+1130:
+1131:      int row_offset = 0;
+1132:      if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
+1133:        row_offset = get<0>(params_problem_shape).cumulative_length[get<2,1>(blk_coord)];
+1134:      }
+1135:
+1136:      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) + params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+1137:
+1138:      if (row_idx < get<0>(problem_shape)) {
+1139:        gLSE(row_idx + row_offset, get<2>(blk_coord)) = lse;
+1140:      }
+1141:    }
+1142:
+1143:    cutlass::arch::fence_view_async_tmem_load();
+1144:
+1145:    pipeline_o.consumer_release(pipeline_o_consumer_state);
+1146:    ++pipeline_o_consumer_state;
+1147:
+1148:    pipeline_epi.producer_commit(pipeline_epi_producer_state);
+1149:    ++pipeline_epi_producer_state;
+1150:
+1151:    pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
+1152:
+1153:    // load from V1
+1154:    copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
+1155:
+1156:    pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+1157:    ++pipeline_s1_c_consumer_state;
+1158:
+1159:    pipeline_o.consumer_wait(pipeline_o_consumer_state);
+1160:    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+1161:
+1162:    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+1163:
+1164:    if (epilogue.params.ptr_LSE != nullptr) {
+1165:      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) + get<0>(TileShapeQK{});
+1166:
+1167:      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) + params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+1168:
+1169:      int row_offset = 0;
+1170:      if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
+1171:        row_offset = get<0>(params_problem_shape).cumulative_length[get<2,1>(blk_coord)];
+1172:      }
+1173:
+1174:      if (row_idx < get<0>(problem_shape)) {
+1175:        gLSE(row_idx + row_offset, get<2>(blk_coord)) = lse;
+1176:      }
+1177:    }
+1178:
+1179:    cutlass::arch::fence_view_async_tmem_load();
+1180:

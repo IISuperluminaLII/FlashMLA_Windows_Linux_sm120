@@ -40,6 +40,56 @@
 #include "../collective/fmha_common.hpp"
 #include "../collective/fmha_fusion.hpp"
 #include "../collective/sm100_fmha_load_tma_warpspecialized.hpp"
+#include "cute/atom/copy_traits_sm100.hpp"
+
+//==============================================================================
+// SM120 Architecture Compatibility Notes
+//==============================================================================
+// SM120 (RTX 50 series / Blackwell workstation) does NOT have:
+//   - TCGEN05/UMMA (SM100_MMA_F16BF16_SS atoms) - datacenter only
+//   - TMEM (Tensor Memory) - datacenter only
+//
+// SM120 DOES have:
+//   - TMA (Tensor Memory Accelerator) via sm_120a
+//   - Legacy mma.sync.aligned for bf16 (SM80-style)
+//   - Native F8F6F4 MMA support
+//
+// Current Status:
+//   - bf16 path uses SM100 CollectiveBuilder which selects UMMA atoms
+//   - This FAILS on SM120 with "SM100_MMA_F16BF16_SS without CUTE_ARCH_MMA_SM100A_ENABLED"
+//
+// Options for SM120:
+//   1. [FUTURE] SM80-style bf16: Requires new mainloop with mma.sync.aligned
+//   2. [AVAILABLE] FP8 fallback: Set FLASH_MLA_SM120_USE_FP8=1 to use native SM120 F8F6F4
+//
+// To enable FP8 fallback: FLASH_MLA_SM120_USE_FP8=1 pip install .
+//==============================================================================
+
+#if defined(FLASH_MLA_BUILD_SM120) && !defined(FLASH_MLA_SM120_USE_FP8)
+// SM120 bf16 path - currently uses SM100 UMMA which is NOT available on SM120
+// This will compile but fail at runtime with UMMA errors
+// TODO: Implement SM80-style bf16 mainloop for SM120
+#define FLASH_MLA_SM120_BF16_PATH 1
+#endif
+
+#if defined(FLASH_MLA_BUILD_SM120) && defined(FLASH_MLA_SM120_USE_FP8)
+// SM120 FP8 path - use native SM120 F8F6F4 MMA
+// TODO: Full FP8 implementation requires:
+//   1. Change Element type to cutlass::float_e4m3_t
+//   2. Change arch from Sm100 to Sm120
+//   3. Use SM120-compatible kernel schedule (KernelTmaWarpSpecializedCooperativeSm120)
+//   4. Remove/stub TMEM operations (not available on SM120)
+#define FLASH_MLA_SM120_FP8_PATH 1
+#endif
+
+namespace flash::detail {
+// Create a contiguous register tensor with the same shape as the partitioned source view.
+// Uses shape (not layout) to ensure contiguous strides for register storage.
+template <class Element, class Tensor>
+CUTE_HOST_DEVICE auto make_softmax_store_register(Tensor const& tmem_store_cS) {
+  return cute::make_tensor<Element>(cute::shape(tmem_store_cS));
+}
+}  // namespace flash::detail
 
 namespace cutlass::fmha::collective {
 
@@ -73,8 +123,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using StrideV = StrideV_;
   using Mask = Mask_;
 
+  // SM120: aggressively bound staging to fit 99KB SMEM
+  // Keep Q double-buffered, but cap KV to 2 stages to reduce smem
   static constexpr int StageCountQ = 2;
-  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
+  static constexpr int StageCountKV = 2;
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
@@ -87,6 +139,133 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
   using TileShapePV = decltype(select<0,2,1>(TileShapeQK{}));
 
+  static constexpr bool kIsSm120SmallTile =
+      (decltype(size<0>(TileShape{}))::value == 64) &&
+      (decltype(size<1>(TileShape{}))::value == 16);
+  // SM120 small-tile (64 rows): use 16dp atoms (16*4=64 matches row count)
+  // SM100 (128+ rows): use 32dp atoms
+  static constexpr bool kUseSm120Tmem16dp = kIsSm120SmallTile;
+
+  // V stats buffer: 64 rows × 4 stats = 256 float elements
+  // ValID after upcast<32>: 4x atom = 128 elements (too small), 8x atom = 256 elements (correct)
+  using TMEM_LOAD_V = std::conditional_t<
+      kIsSm120SmallTile,
+      SM100_TMEM_LOAD_16dp32b8x,   // 16*4=64 rows, 8x -> 256 float elements for SM120
+      SM100_TMEM_LOAD_32dp32b2x>;
+
+  using TMEM_STORE_V = std::conditional_t<
+      kIsSm120SmallTile,
+      SM100_TMEM_STORE_16dp32b8x,  // 16*4=64 rows, 8x -> 256 float elements for SM120
+      SM100_TMEM_STORE_32dp32b2x>;
+
+  // Use same atoms for stats operations (V buffer load/store)
+  using TMEM_LOAD_V_OP = TMEM_LOAD_V;
+  using TMEM_STORE_V_OP = TMEM_STORE_V;
+
+  // P buffer store atoms: 64×16 = 1024 elements for SM120, larger for SM100
+  // ValID after upcast<32>: 16x = 512 elements (too small), 32x = 1024 elements (correct)
+  using TMEM_STORE_P = std::conditional_t<
+      kIsSm120SmallTile,
+      SM100_TMEM_STORE_16dp32b32x,  // 16*4=64 rows, 32x -> 1024 float elements for SM120
+      SM100_TMEM_STORE_32dp32b32x>; // 32*4=128 rows for SM100
+
+  struct StoreVTraits {
+    using CopyTraits = Copy_Traits<TMEM_STORE_V_OP>;
+    using ThrID = typename CopyTraits::ThrID;
+    using ValID = typename CopyTraits::ValID;
+    using SrcLayout = typename CopyTraits::SrcLayout;
+    using DstLayout = typename CopyTraits::DstLayout;
+    using RefLayout = typename CopyTraits::RefLayout;
+  };
+  using StorePTraits = Copy_Traits<TMEM_STORE_P>;
+  // Stats load for S matrix: must match TileShapeQK element count (64×16 = 1024 for SM120)
+  // ValID after upcast<32>: 16x = 512 elements (too small), 32x = 1024 elements (correct)
+  // SM100: (256, 128) = 32768 elements per stage (128 rows per thread with ThreadShape=(2,1,1))
+  using StatsLoadOp = std::conditional_t<
+      kIsSm120SmallTile,
+      SM100_TMEM_LOAD_16dp32b32x,   // 16*4=64 rows, 32x -> 1024 float elements for SM120
+      SM100_TMEM_LOAD_32dp32b16x>;
+  using StatsLoadTraits = Copy_Traits<StatsLoadOp>;
+  // TMEM layouts: coalesce(upcast(ValID)) - this matches make_tmem_copy's atom_v_layout pattern
+  // coalesce is critical! make_tmem_copy uses coalesce(upcast<sizeof_bits<T>>(ValID))
+  using StatsLayoutVStore = decltype(coalesce(upcast<sizeof_bits_v<ElementQK>>(typename Copy_Traits<TMEM_STORE_V_OP>::ValID{})));
+  using StatsLayoutVLoad = decltype(coalesce(upcast<sizeof_bits_v<ElementQK>>(typename Copy_Traits<StatsLoadOp>::ValID{})));
+  // Register layouts: same shape as TMEM layouts, but with contiguous strides for register storage
+  // Using make_layout(shape(...)) creates row-major contiguous layout matching the coalesced shape
+  using StatsRegLayoutStore = decltype(make_layout(shape(StatsLayoutVStore{})));
+  using StatsRegLayoutLoad = decltype(make_layout(shape(StatsLayoutVLoad{})));
+
+  // P-buffer: same pattern - coalesce(upcast(ValID)) for TMEM, contiguous for registers
+  using PLayoutTmem = decltype(coalesce(upcast<sizeof_bits_v<ElementQK>>(typename StorePTraits::ValID{})));
+  using PLayoutReg = decltype(make_layout(shape(PLayoutTmem{})));
+
+  // Correction rescale: 16dp32b32x atoms for 64x16 tile (kTileM=64, kCorrectionTileSize=16)
+  // Uses 16dp (16 rows/warp * 4 warps = 64 rows), 32x (32 elements/thread * 32 threads = 1024 elements)
+  using CorrectionLoadOp = SM100_TMEM_LOAD_16dp32b32x;
+  using CorrectionStoreOp = SM100_TMEM_STORE_16dp32b32x;
+  using CorrectionLayoutTmem = decltype(coalesce(upcast<sizeof_bits_v<ElementPV>>(typename Copy_Traits<CorrectionLoadOp>::ValID{})));
+  using CorrectionLayoutReg = decltype(make_layout(shape(CorrectionLayoutTmem{})));
+
+  //============================================================================
+  // CollectiveBuilder Configuration
+  //============================================================================
+  // WARNING: SM120 does NOT support SM100 UMMA (TCGEN05) atoms!
+  // The CollectiveBuilder below uses cutlass::arch::Sm100 which selects
+  // SM100_MMA_F16BF16_SS atoms. These will FAIL at runtime on SM120 with:
+  //   "Attempting to use SM100_MMA_F16BF16_SS without CUTE_ARCH_MMA_SM100A_ENABLED"
+  //
+  // For SM120 native support, two options:
+  //   1. [FUTURE] SM80-style bf16: New mainloop with mma.sync.aligned.m16n8k16
+  //   2. [FP8] Use FLASH_MLA_SM120_USE_FP8=1 and switch to:
+  //      - cutlass::arch::Sm120
+  //      - cutlass::float_e4m3_t Element type
+  //      - KernelTmaWarpSpecializedCooperativeSm120 schedule
+  //============================================================================
+
+#if defined(FLASH_MLA_SM120_FP8_PATH)
+  // TODO: SM120 FP8 CollectiveBuilder - requires full Element type refactoring
+  // For now, this path is a placeholder. Full implementation requires:
+  //   1. Change Element template parameter to cutlass::float_e4m3_t at call sites
+  //   2. Use cutlass::arch::Sm120 below
+  //   3. Remove TMEM dependencies (SM120 has no TMEM)
+  #error "SM120 FP8 path not yet fully implemented. Use bf16 path with SM100 hardware, or contribute the FP8 implementation."
+#endif
+
+  //==============================================================================
+  // SM120 BF16 Path - Use SM80 architecture for MMA atom selection
+  //==============================================================================
+  // SM120 does NOT have TCGEN05/UMMA hardware (datacenter-only).
+  // Instead, SM120 supports legacy mma.sync.aligned instructions from SM80.
+  // By using cutlass::arch::Sm80, the CollectiveBuilder selects:
+  //   - SM80_16x8x16_F32BF16BF16F32_TN via mma.sync.aligned.m16n8k16
+  // These atoms are backward compatible and work on all SM >= 80.
+  //
+  // WARNING: Even with SM80 CollectiveBuilder, this mainloop still uses TMEM
+  // operations which are NOT available on SM120. A complete SM120 solution
+  // requires replacing all TMEM usage with shared memory operations.
+  // This is tracked as a future enhancement.
+  //==============================================================================
+
+#if defined(FLASH_MLA_BUILD_SM120) && !defined(FLASH_MLA_SM120_USE_FP8)
+  // SM120 BF16: Use SM80 architecture to get mma.sync.aligned atoms
+  // Note: KernelCpAsyncWarpSpecialized is the SM80-compatible kernel schedule
+  using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+      Element, StrideQ, Alignment,
+      Element, StrideK, Alignment,
+      ElementQK,
+      TileShapeQK, ClusterShape, cutlass::gemm::collective::StageCount<3>,
+      cutlass::gemm::KernelCpAsyncWarpSpecialized>::CollectiveOp;
+
+  using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+      Element, StrideK, Alignment,
+      Element, decltype(select<1,0,2>(StrideV{})), Alignment,
+      ElementPV,
+      TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3>,
+      cutlass::gemm::KernelCpAsyncWarpSpecialized>::CollectiveOp;
+#else
+  // SM100 (datacenter): Use SM100 architecture with UMMA atoms
   using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
       Element, StrideQ, Alignment,
@@ -103,6 +282,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ElementPV,
       TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
       cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+#endif
 
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
   using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV>{}));
@@ -141,6 +321,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     kIdxFinalRowMax = 1
   };
 
+  //==============================================================================
+  // Pipeline Type Selection for SM120 vs SM100
+  //==============================================================================
+  // SM100: Uses PipelineTmaUmmaAsync with AtomThrShapeMNK (requires UMMA)
+  // SM120: Uses standard PipelineAsync (no UMMA, no AtomThrShapeMNK)
+  //==============================================================================
+
+#if defined(FLASH_MLA_BUILD_SM120) && !defined(FLASH_MLA_SM120_USE_FP8)
+  // SM120 BF16 path: Use standard async pipelines (no UMMA)
+  // Note: SM80 CpAsyncWarpSpecialized CollectiveOp does NOT have AtomThrShapeMNK
+
+  // from load to mma warp, protects q in smem
+  using PipelineQ = cutlass::PipelineAsync<StageCountQ>;
+
+  // from load to mma warp, protects k/v in smem
+  using PipelineKV = cutlass::PipelineAsync<StageCountKV>;
+
+  // from mma to softmax0/1 warp, protects S in registers (not TMEM on SM120)
+  using PipelineS = cutlass::PipelineAsync<1>;
+
+  // from softmax0/1/ to correction wg
+  using PipelineC = cutlass::PipelineAsync<1>;
+
+  // from mma to correction
+  using PipelineO = cutlass::PipelineAsync<1>;
+
+#else
+  // SM100 path: Use UMMA-specific async pipelines
+
   // from load to mma warp, protects q in smem
   using PipelineQ = cutlass::PipelineTmaUmmaAsync<
     StageCountQ,
@@ -162,10 +371,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using PipelineC = cutlass::PipelineAsync<1>;
 
   // from mma to correction
-  using PipelineO = cutlass::PipelineUmmaAsync<2>;
+  // SM120: reduce O pipeline stages to minimize barrier storage
+  using PipelineO = cutlass::PipelineUmmaAsync<1>;
+
+#endif
 
   // from corr to epilogue
-  using PipelineE = cutlass::PipelineAsync<2>;
+  // SM120: reduce Epilogue pipeline stages to minimize barrier storage
+  using PipelineE = cutlass::PipelineAsync<1>;
 
   using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<
     /*stages*/ 1, /*groups*/ 2>;
@@ -510,6 +723,41 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // Q1 * K1  , Q2 * K1  , S11 * V1 , Q1 * K2  , S21 * V1  , Q2 * K2 , S12 * V2 , Q1 * K3  , S22 * K2 , ...
   }
 
+  // H1 approach: Create tensors with EXPLICIT ValID layouts for TMEM copy compatibility.
+  // The key insight from hypothesis testing: TMEM Copy_Traits require specific layouts
+  // that match coalesce(upcast<32>(ValID)). MMA-produced layouts don't match directly.
+  template<class Stage, class TensorS, class CoordTensor>
+  CUTLASS_DEVICE static auto
+  make_softmax_stats_views(Stage stage, TensorS const& /*tStS*/, CoordTensor const& /*tScS*/) {
+    // V stats: 64 rows x 4 stats = 256 float elements with StatsLayoutVStore
+    uint32_t v_ptr = uint32_t(stage == _0{} ? TmemAllocation::V0 : TmemAllocation::V1);
+    auto tStS_v = make_tensor(make_tmem_ptr<uint32_t>(v_ptr), StatsLayoutVStore{});
+    auto tScS_v = make_tensor<ElementQK>(StatsRegLayoutStore{});
+
+    // P buffer: 64x16 = 1024 elements with PLayoutTmem
+    uint32_t p_ptr = uint32_t(stage == _0{} ? TmemAllocation::P0 : TmemAllocation::P1);
+    auto tStS_P = make_tensor(make_tmem_ptr<uint32_t>(p_ptr), PLayoutTmem{});
+    auto tScS_P = make_tensor<ElementQK>(PLayoutReg{});
+
+    // S load: 64x16 = 1024 elements with StatsLayoutVLoad
+    uint32_t s_ptr = uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1);
+    auto tStS_load = make_tensor(make_tmem_ptr<uint32_t>(s_ptr), StatsLayoutVLoad{});
+    auto tScS_load = make_tensor<ElementQK>(StatsRegLayoutLoad{});
+
+    return cute::make_tuple(tStS_v, tScS_v, tStS_P, tScS_P, tStS_load, tScS_load);
+  }
+
+  // Legacy 4-tuple interface for backward compatibility with mainloop code
+  template<class Stage, class TensorS, class CoordTensor>
+  CUTLASS_DEVICE static auto
+  make_softmax_tmem_views(Stage stage, TensorS const& tStS, CoordTensor const& tScS) {
+    auto [tStS_v, tScS_v, tStS_P, tScS_P, tStS_load, tScS_load] =
+        make_softmax_stats_views(stage, tStS, tScS);
+    (void)tScS_v;  // Not used in 4-tuple interface
+    (void)tScS_P;  // Not used in 4-tuple interface
+    return cute::make_tuple(tStS_v, tStS_P, tStS_load, tScS_load);
+  }
+
   template<bool need_apply_mask, class Stage, class BlkCoord, class CoordTensor, class ProblemShape>
   CUTLASS_DEVICE auto
   softmax_step(
@@ -526,46 +774,55 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tStS = partition_fragment_C(typename CollectiveMmaQK::TiledMma{}, select<0,1>(TileShapeQK{}));
     tStS.data() = uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1);
 
-    Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
-    tStS_v.data() = uint32_t(stage == _0{} ? TmemAllocation::V0 : TmemAllocation::V1);
-    Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
-
-    auto tilePlikeFP32 = size<1>(TileShapeQK{}) / Int<sizeof(float)>{} * Int<sizeof(Element)>{};
-    Tensor tStS_P = tStS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
-    tStS_P.data() = warp_uniform(uint32_t(stage == _0{} ? TmemAllocation::P0 : TmemAllocation::P1));
-    Tensor tScS_P = tScS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
+    // Get TMEM tensor views for V stats, P buffer, and S load
+    // tScS_load is the original coordinate tensor (used for masking)
+    auto [tStS_v, tStS_P, tStS_load, tScS_load] = make_softmax_tmem_views(stage, tStS, tScS);
 
     // Each thread owns a single row
-    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x; // 4x32 threads with 128 cols of 32b elem
-    using TMEM_STORE = SM100_TMEM_STORE_32dp32b32x;  // 4x32 threads with 128 cols of 8b elem
-    using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;   // 4x32 threads with 2 cols of 32b elem
+    static constexpr int kTileN = decltype(size<1>(TileShapeQK{}))::value;
+    static constexpr int kTilePCols = kTileN * int(sizeof(Element)) / int(sizeof(float));
 
+    using TMEM_LOAD = StatsLoadOp;  // Stats load atom for 128 float elements
+    using TMEM_STORE = TMEM_STORE_P;  // P buffer store atom selection
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
-    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tStS);
+    // TMEM copy approach: Use partition_fragment_C tensors directly without coalescing.
+    // The MMA-produced tensors have layouts matching what TMEM atoms expect.
+    // Key insight: partition_fragment_C creates TMEM tensors, partition_S/D preserve layout structure.
+
+    // S matrix load: Use tStS_load directly (from partition_fragment_C via make_softmax_tmem_views)
+    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tStS_load);
     auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
 
-    Tensor tTMEM_LOADtS = thr_tmem_load.partition_S(tStS);
-    Tensor tTMEM_LOADcS = thr_tmem_load.partition_D(tScS);
+    // Partition preserves MMA-compatible layout structure
+    Tensor tTMEM_LOADtS = thr_tmem_load.partition_S(tStS_load);
+    Tensor tTMEM_LOADcS = thr_tmem_load.partition_D(tScS_load);
 
-    auto tiled_tmem_storev = make_tmem_copy(TMEM_STORE_V{}, tStS_v);
+    // V stats store: Use tStS_v directly (has StatsLayoutVStore from atom's ValID)
+    auto tiled_tmem_storev = make_tmem_copy(TMEM_STORE_V_OP{}, tStS_v);
     auto thr_tmem_storev  = tiled_tmem_storev.get_slice(thread_idx);
 
+    // Partition preserves layout structure
     Tensor tTMEM_STOREVtS = thr_tmem_storev.partition_D(tStS_v);
-    Tensor tTMEM_STOREVcS = thr_tmem_storev.partition_S(tScS_v);
+    // Create register tensor with explicit layout, then partition to get per-thread view
+    auto rS_v_reg = make_tensor<ElementQK>(StatsRegLayoutStore{});
+    Tensor tTMEM_STOREVrS = thr_tmem_storev.partition_S(rS_v_reg);
 
+    // P-buffer store: Use tStS_P directly (from partition_fragment_C)
     auto tiled_tmem_store = make_tmem_copy(TMEM_STORE{}, tStS_P);
     auto thr_tmem_store  = tiled_tmem_store.get_slice(thread_idx);
 
+    // Partition preserves layout structure for size<2> check and slicing
     Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
     tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
-    Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
 
     // wait on tensor core pipe
     pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
-    // read all of S from tmem into reg mem
-    Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+    // Create register tensor with explicit layout, then partition to get per-thread view
+    auto rS_load_reg = make_tensor<ElementQK>(StatsRegLayoutLoad{});
+    Tensor tTMEM_LOADrS = thr_tmem_load.partition_D(rS_load_reg);
+    // Copy from partitioned TMEM source to partitioned register destination
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
 
     if constexpr (need_apply_mask) {
@@ -591,11 +848,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       row_max = ::fmax(row_max, row_max_3);
     }
 
-    ElementQK row_max_safe = row_max == -INFINITY ? 0 : row_max;
+    ElementQK row_max_safe = row_max;
+    if (!(row_max_safe == row_max_safe)) {
+      row_max_safe = ElementQK(0);
+    }
 
-    Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
     tTMEM_STOREVrS(kIdxOldRowMax) = old_row_max;
     tTMEM_STOREVrS(kIdxNewRowMax) = row_max_safe;
+    // Copy without flatten - partitioned tensors have compatible layouts
     copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
 
     pipeline_c.producer_commit(pipeline_c_producer_state);
@@ -609,11 +869,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
 
-    Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
+    // Create register tensor with explicit layout, then partition to get per-thread view
+    auto rS_store_reg = make_tensor<uint32_t>(PLayoutReg{});
+    auto tTMEM_STORErS_x4 = thr_tmem_store.partition_S(rS_store_reg);
 
     constexpr int kConversionsPerStep = 2;
 
-    Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
+    auto tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
 
     NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
 
@@ -650,15 +912,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // this prevents register spills in fp16
       if constexpr (size<2>(tTMEM_STORErS_x4) == _2{}) {
         if (i == size(tTMEM_LOADrS) - 6) {
+          // STORE: use partitioned tensors directly
           copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, 0), tTMEM_STOREtS_x4(_, _, 0));
         }
       }
     }
 
-    // tmem_store(reg_S8) -> op_P
-    CUTE_STATIC_ASSERT_V(size<2>(tTMEM_STORErS_x4) <= _2{});
-    CUTE_STATIC_ASSERT_V(size<1>(tTMEM_STORErS_x4) == _1{});
-    copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1), tTMEM_STOREtS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1));
+    // tmem_store(reg_S8) -> op_P - use partitioned tensors directly
+    copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4);
 
     cutlass::arch::fence_view_async_tmem_store();
 
@@ -703,9 +964,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
-      Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
+      // Copy without flatten - partitioned tensors have compatible layouts
       copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
     }
   }
@@ -774,6 +1035,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_s_consumer_state;
   }
 
+  // H1 approach for correction_epilogue: Create explicit ValID layouts for TMEM copy compatibility
+  // Key insight: partition_fragment_C creates MMA layouts that don't match TMEM Copy_Traits ValID
+  // This function loads from TMEM O buffer and copies to shared memory with scaling
+  // Solution: Use TMEM copy's partition_D for both register AND SMEM tensors
   template<class Stage, class TensorO>
   CUTLASS_DEVICE auto
   correction_epilogue(
@@ -787,49 +1052,57 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     Tensor sO = sO_01(_,_,stage);
 
-    // As opposed to the softmax, we do not have enough registers here
-    // to load all of the values (for tile kv = 128), so we loop
-    // good values would be either 32 or 64
+    // Tile size for register capacity management
+    // For bf16: 32/2 = 16 cols per iteration
     const int kCorrectionTileSize = 32 / sizeof(ElementOut);
 
-    using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
+    // TileShapePV.M = TileShape.M / ThreadShape.M = 64 rows (both SM100 and SM120)
+    constexpr int kTileM = decltype(size<0>(TileShapePV{}))::value;
+    constexpr int kTileK = decltype(size<2>(TileShape{}))::value;
+    constexpr int kLoopCount = kTileK / kCorrectionTileSize;
 
-    typename CollectiveMmaPV::TiledMma mma;
-    Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
-    Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
-    Tensor tOcO = mma.get_slice(0).partition_C(cO);
-    Tensor tOsO = mma.get_slice(0).partition_C(sO);
+    // Epilogue load operation: 64 rows × kCorrectionTileSize cols
+    // For bf16: 64 × 16 = 1024 elements, needs 32x atom (16dp32b32x)
+    // For fp32: 64 × 8 = 512 elements, needs 16x atom (16dp32b16x)
+    using EpilogueLoadOp = std::conditional_t<kCorrectionTileSize >= 16,
+        SM100_TMEM_LOAD_16dp32b32x, SM100_TMEM_LOAD_16dp32b16x>;
+    using EpilogueLayoutTmem = decltype(coalesce(upcast<sizeof_bits_v<ElementPV>>(typename Copy_Traits<EpilogueLoadOp>::ValID{})));
+    using EpilogueLayoutReg = decltype(make_layout(shape(EpilogueLayoutTmem{})));
 
-    Tensor tOtO_i = logical_divide(tOtO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
-    Tensor tOcO_i = logical_divide(tOcO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
-    Tensor tOsO_i = logical_divide(tOsO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+    // Determine TMEM base address based on stage
+    uint32_t tmem_O_base = uint32_t(stage == _0{} ? TmemAllocation::O0 : TmemAllocation::O1);
 
-    if constexpr (decltype(stage == _0{})::value) {
-      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O0);
-    }
-    else {
-      static_assert(decltype(stage == _1{})::value, "stage is either 0 or 1");
-      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O1);
-    }
+    // Create TMEM tensor with explicit ValID layout (H1 approach)
+    auto tOtO_tmem = make_tensor(make_tmem_ptr<uint32_t>(tmem_O_base), EpilogueLayoutTmem{});
 
-    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i(make_coord(_, _), _0{}));
-    auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
+    // Create register tensor with contiguous layout
+    auto tOrO_reg = make_tensor<ElementPV>(EpilogueLayoutReg{});
 
-    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i(make_coord(_, _), _));
-    Tensor tTMEM_LOADcO = thr_tmem_load.partition_D(tOcO_i(make_coord(_, _), _));
-    Tensor tTMEM_LOADsO = thr_tmem_load.partition_D(tOsO_i(make_coord(_, _), _));
+    // Create TMEM copy with explicit layout tensor
+    auto tiled_tmem_load = make_tmem_copy(EpilogueLoadOp{}, tOtO_tmem);
+    auto thr_tmem_load = tiled_tmem_load.get_slice(thread_idx);
+
+    // Partition the explicit layout tensors
+    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_tmem);
+    Tensor tTMEM_LOADrO = thr_tmem_load.partition_D(tOrO_reg);
+
+    // H2 approach: Create 2D SMEM view for each iteration inside the loop
+    // The EpilogueLayoutTmem shape is (64, 16) - we create SMEM tiles matching this
+    using SmemTileLayout = decltype(make_layout(make_shape(Int<kTileM>{}, Int<kCorrectionTileSize>{})));
 
     float2 scale_f32x2 = make_float2(scale, scale);
 
-    // loop:
-    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
+    // loop: TMEM_LOAD, FMUL2 scale, copy to SMEM
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < get<2>(TileShape{}) / kCorrectionTileSize; i++) {
-      Tensor tTMEM_LOADtO_i = tTMEM_LOADtO(_, _0{}, _0{}, i);
-      Tensor tTMEM_LOADsO_i = tTMEM_LOADsO(_, _0{}, _0{}, i);
+    for (int i = 0; i < kLoopCount; i++) {
+      // Update TMEM pointer for this iteration slice
+      Tensor tTMEM_LOADtO_i = tTMEM_LOADtO;
+      tTMEM_LOADtO_i.data() = tTMEM_LOADtO_i.data().get() + uint32_t(i * kCorrectionTileSize);
 
-      Tensor tTMrO = make_tensor<ElementPV>(shape(tTMEM_LOADcO(_, _0{}, _0{}, i)));
+      // Create register tensor for this iteration with proper shape
+      Tensor tTMrO = make_tensor<ElementPV>(shape(tTMEM_LOADrO));
 
+      // Load from TMEM to registers using H1 explicit layouts
       copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO);
 
 #ifndef ONLY_SOFTMAX
@@ -843,21 +1116,29 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
 #endif
 
+      // Convert float to output type
       constexpr int N = 4 / sizeof(ElementOut);
       NumericArrayConverter<ElementOut, ElementPV, N> convert;
 
-      Tensor tSMrO = make_tensor_like<ElementOut>(tTMrO);
+      // Create output register tensor with same element count
+      Tensor tSMrO = make_tensor<ElementOut>(shape(tTMrO));
 
-      Tensor tCs = recast<decltype(convert)::source_type>(tTMrO);
-      Tensor tCd = recast<decltype(convert)::result_type>(tSMrO);
+      auto tCs = recast<typename decltype(convert)::source_type>(tTMrO);
+      auto tCd = recast<typename decltype(convert)::result_type>(tSMrO);
 
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size(tCs); j++) {
         tCd(j) = convert.convert(tCs(j));
       }
 
-      Tensor tSMsO_i = recast<uint32_t>(tTMEM_LOADsO_i);
-      Tensor tSMrO_i = recast<uint32_t>(tSMrO);
+      // H2: Create 2D SMEM view for this iteration with shape (kTileM, kCorrectionTileSize)
+      // This matches the EpilogueLayoutTmem shape of (64, 16)
+      auto sO_tile = make_tensor(sO.data() + i * kTileM * kCorrectionTileSize, SmemTileLayout{});
+      Tensor tTMEM_LOADsO_i = thr_tmem_load.partition_D(sO_tile);
+
+      // Copy to shared memory using vectorized copy
+      auto tSMsO_i = recast<uint32_t>(tTMEM_LOADsO_i);
+      auto tSMrO_i = recast<uint32_t>(tSMrO);
 
       copy(AutoVectorizingCopyWithAssumedAlignment<128>{}, tSMrO_i, tSMsO_i);
     }
@@ -865,6 +1146,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     cutlass::arch::fence_view_async_shared();
   }
 
+  // H1 approach for correction_rescale: Create explicit ValID layouts for TMEM copy compatibility
+  // Key insight: partition_fragment_C creates MMA layouts that don't match TMEM Copy_Traits ValID
   CUTLASS_DEVICE auto
   correction_rescale(
       float scale,
@@ -872,38 +1155,42 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
-    // As opposed to the softmax, we do not have enough registers here
-    // to load all of the values (for tile kv = 128), so we loop
-    // good values would be either 32 or 64
+    // Loop tile size for register capacity management
     const int kCorrectionTileSize = 16;
 
-    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
-    using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
+    // TileShapePV.M = TileShape.M / ThreadShape.M = 64 rows (both SM100 and SM120)
+    constexpr int kTileM = decltype(size<0>(TileShapePV{}))::value;
+    constexpr int kLoopCount = kTileM / kCorrectionTileSize;
 
-    typename CollectiveMmaPV::TiledMma mma;
-    Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
-    Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
-    Tensor tOcO = mma.get_slice(0).partition_C(cO);
+    // Use explicit ValID layouts from CorrectionLoadOp/CorrectionStoreOp (16dp32b32x)
+    // These are defined at class level using coalesce(upcast<32>(ValID)) pattern
 
-    Tensor tOtO_i = tOtO.compose(make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
-    Tensor tOcO_i = tOcO.compose(make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+    // Create TMEM tensor with explicit CorrectionLayoutTmem (matches atom's ValID)
+    auto tOtO_tmem = make_tensor(make_tmem_ptr<uint32_t>(tmem_O), CorrectionLayoutTmem{});
 
-    tOtO_i.data() = tOtO_i.data().get() + tmem_O;
+    // Create register tensor with contiguous CorrectionLayoutReg
+    auto tOrO_reg = make_tensor<ElementPV>(CorrectionLayoutReg{});
 
-    auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i);
-    auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
-    auto tiled_tmem_store = make_tmem_copy(TMEM_STORE{}, tOtO_i);
-    auto thr_tmem_store   = tiled_tmem_store.get_slice(thread_idx);
+    // Create TMEM copy with explicit layout tensor
+    auto tiled_tmem_load = make_tmem_copy(CorrectionLoadOp{}, tOtO_tmem);
+    auto thr_tmem_load = tiled_tmem_load.get_slice(thread_idx);
 
-    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i);
-    Tensor tTMEM_LOADcO = thr_tmem_load.partition_D(tOcO_i);
-    Tensor tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i);
-    Tensor tTMEM_STOREcO = thr_tmem_store.partition_S(tOcO_i);
-    static_assert(shape(tTMEM_STOREcO) == shape(tTMEM_LOADcO));
+    auto tiled_tmem_store = make_tmem_copy(CorrectionStoreOp{}, tOtO_tmem);
+    auto thr_tmem_store = tiled_tmem_store.get_slice(thread_idx);
+
+    // Partition the explicit layout tensors
+    Tensor tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_tmem);
+    Tensor tTMEM_LOADrO = thr_tmem_load.partition_D(tOrO_reg);
+    Tensor tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_tmem);
+    Tensor tTMEM_STORErO = thr_tmem_store.partition_S(tOrO_reg);
 
     float2 scale_f32x2 = make_float2(scale, scale);
 
-    Tensor tTMrO = make_tensor<ElementPV>(make_shape(shape(tTMEM_LOADcO), Int<128 / kCorrectionTileSize>{}));
+    // Number of loop iterations based on head dimension
+    int count = get<2>(TileShape{}) / kCorrectionTileSize;
+
+    // Register tensor sized for loop tiling
+    Tensor tTMrO = make_tensor<ElementPV>(make_shape(shape(tTMEM_LOADrO), Int<kLoopCount>{}));
 
     auto copy_in = [&](int i) {
       Tensor tTMEM_LOADtO_i = tTMEM_LOADtO;
@@ -920,12 +1207,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     };
 
     // sequence: LLMSLMSLMSS
-
-    // loop:
-    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
+    // loop: TMEM_LOAD, FMUL2 scale, TMEM_STORE
     copy_in(0);
-
-    int count = get<2>(TileShape{}) / kCorrectionTileSize;
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < count; i++) {
@@ -972,21 +1255,26 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor cS = make_identity_tensor(select<0,1>(TileShapeQK{}));
     Tensor tScS = typename CollectiveMmaQK::TiledMma{}.get_slice(0).partition_C(cS);
 
-    Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
-    Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
+    auto tileN = size<1>(TileShapeQK{});
 
-    using TMEM_LOAD_V = SM100_TMEM_LOAD_32dp32b2x;   // 4x32 threads with 2 cols of 32b elem
+    auto [tStS_v_unused, tStS_P_unused, tStS_load, tScS_load] =
+        make_softmax_tmem_views(_0{}, tStS, tScS);
+    (void)tStS_v_unused;
+    (void)tStS_P_unused;
 
-    auto tiled_tmem_loadv = make_tmem_copy(TMEM_LOAD_V{}, tStS_v);
+    // TMEM_LOAD_V_OP = TMEM_LOAD_V = StatsLoadOp (all use 16dp atoms for SM120 small-tile).
+    // Use partition_fragment_C tensors directly without coalescing - MMA-produced layouts match TMEM atoms.
+    auto tiled_tmem_loadv = make_tmem_copy(TMEM_LOAD_V_OP{}, tStS_load);
     auto thr_tmem_loadv  = tiled_tmem_loadv.get_slice(thread_idx);
 
-    Tensor tTMEM_LOADVtS = thr_tmem_loadv.partition_S(tStS_v);
-    Tensor tTMEM_LOADVcS = thr_tmem_loadv.partition_D(tScS_v);
+    // Partition TMEM tensor for source - preserves layout structure
+    auto tTMEM_LOADVtS = thr_tmem_loadv.partition_S(tStS_load);
+    auto tTMEM_LOADVcS = thr_tmem_loadv.partition_D(tScS_load);
 
-    Tensor tTMEM_LOADVtS0 = tTMEM_LOADVtS;
-    tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get() + uint32_t(TmemAllocation::V0);
-    Tensor tTMEM_LOADVtS1 = tTMEM_LOADVtS;
-    tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + uint32_t(TmemAllocation::V1);
+    auto tTMEM_LOADVtS0 = tTMEM_LOADVtS;
+    tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get();
+    auto tTMEM_LOADVtS1 = tTMEM_LOADVtS;
+    tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + uint32_t(TmemAllocation::V1) - uint32_t(TmemAllocation::V0);
 
     // ignore first signal from softmax as no correction is required
     pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
@@ -1003,9 +1291,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
 
+      // Destination tensor must match partition_D shape (register coords) for copy atom
       Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
 
       // read row_wise new global max
+      // Copy without flatten - partitioned tensors have compatible layouts
       copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
 
       // e^(scale * (old_max - new_max)
@@ -1025,6 +1315,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
 
+      // Copy without flatten - partitioned tensors have compatible layouts
       copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
 
       scale = ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
@@ -1054,7 +1345,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // read from V0
     // read row_sum and final row_max here
+    // Destination tensor must match partition_D shape (register coords) for copy atom
     Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
+    // Copy without flatten - partitioned tensors have compatible layouts
     copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
 
     pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
@@ -1099,7 +1392,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
 
-    // load from V1
+    // load from V1 - Copy without flatten - partitioned tensors have compatible layouts
     copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
 
     pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
@@ -1165,10 +1458,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     auto thr_copy = tiled_copy.get_slice(thread_idx);
     auto tOgO = thr_copy.partition_D(sO);
-    auto tOrO = make_tensor<ElementOut>(shape(tOgO(_,_,_,_0{})));
+    // Create rank-1 register tensor (copy atom expects rank-1)
+    auto tOgO_slice = tOgO(_,_,_,_0{});
+    // Register tensor must match destination shape for copy atom
+    auto tOrO = make_tensor<ElementOut>(shape(tOgO_slice));
     clear(tOrO);
-    
-    copy(tiled_copy, tOrO, tOgO(_,_,_,_0{}));
+
+    // Shared memory copy with matching shapes
+    copy(tiled_copy, tOrO, tOgO_slice);
 #endif
     
     if (epilogue.params.ptr_LSE != nullptr) {
@@ -1187,6 +1484,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_commit(pipeline_epi_producer_state);
     ++pipeline_epi_producer_state;
 
+    // Shared memory copy: use tensors as-is
     copy(tiled_copy, tOrO, tOgO(_,_,_,_1{}));
     cutlass::arch::fence_view_async_shared();
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);

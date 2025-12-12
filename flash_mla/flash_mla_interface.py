@@ -1,4 +1,5 @@
 import importlib
+import math
 import os
 from types import ModuleType
 from typing import Optional, Tuple
@@ -48,6 +49,8 @@ def _load_flash_mla_extension() -> ModuleType:
 
 flash_mla_cuda = _load_flash_mla_extension()
 FLASH_MLA_LOADED_VARIANT = getattr(flash_mla_cuda, "__flash_mla_variant__", "legacy")
+
+TILE_SCHEDULER_METADATA_SIZE = 8
 
 
 def _legacy_flash_mla_fwd(
@@ -131,7 +134,118 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return flash_mla_cuda.get_mla_decoding_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
+    def _fallback_metadata() -> Tuple[torch.Tensor, torch.Tensor]:
+        device = cache_seqlens.device
+        tile_scheduler_metadata = torch.zeros(
+            (1, TILE_SCHEDULER_METADATA_SIZE), dtype=torch.int32, device=device
+        )
+        num_splits = torch.arange(
+            0, cache_seqlens.size(0) + 1, dtype=torch.int32, device=device
+        )
+        return tile_scheduler_metadata, num_splits
+
+    force_fallback = os.getenv("FLASH_MLA_FORCE_FALLBACK", "0").lower() in {"1", "true", "yes"}
+    if force_fallback or FLASH_MLA_LOADED_VARIANT != "sm120":
+        return _fallback_metadata()
+
+    try:
+        return flash_mla_cuda.get_mla_decoding_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q,
+            is_fp8_kvcache,
+            topk,
+        )
+    except RuntimeError as exc:
+        if "Unsupported GPU architecture" in str(exc):
+            return _fallback_metadata()
+        raise
+
+
+def _fallback_flash_mla_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    softmax_scale: Optional[float],
+    causal: bool,
+    indices: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = q.device
+    dtype = q.dtype
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    b, s_q, h_q, d = q.shape
+    block_size = k_cache.size(1)
+    h_kv = k_cache.size(2)
+    total_heads_k = h_kv
+    out = torch.empty(b, s_q, h_q, head_dim_v, device=device, dtype=dtype)
+    lse = torch.empty(b, h_q, s_q, device=device, dtype=torch.float32)
+
+    k_cache_fp32 = k_cache.to(torch.float32)
+    block_table_device = block_table.to(device)
+    cache_seqlens_cpu = cache_seqlens.to("cpu")
+
+    if indices is not None:
+        indices = indices.to(device)
+
+    def _get_topk_mask(local_indices: torch.Tensor, seq_len_k: int) -> torch.Tensor:
+        mask = torch.zeros(s_q, seq_len_k, dtype=torch.bool, device=device)
+        for qi in range(s_q):
+            row = local_indices[qi]
+            valid = row[row != -1]
+            if valid.numel() > 0:
+                mask[qi, valid] = True
+        return mask
+
+    for batch_idx in range(b):
+        cur_len = int(cache_seqlens_cpu[batch_idx].item())
+        if cur_len == 0:
+            out[batch_idx].zero_()
+            lse[batch_idx].fill_(float("inf"))
+            continue
+
+        num_blocks = math.ceil(cur_len / block_size)
+        block_ids = block_table_device[batch_idx, :num_blocks]
+        kv_tiles = k_cache_fp32[block_ids]  # [num_blocks, block_size, h_kv, d]
+        kv_tokens = kv_tiles.view(-1, h_kv, k_cache_fp32.size(-1))[:cur_len]
+        kv_tokens = kv_tokens.transpose(0, 1).contiguous()  # [h_kv, cur_len, d]
+
+        query = q[batch_idx].transpose(0, 1).to(torch.float32)  # [h_q, s_q, d]
+        value = kv_tokens[:, :, :head_dim_v]
+        key = kv_tokens
+
+        if total_heads_k != 1:
+            key = key.repeat_interleave(h_q // total_heads_k, dim=0)
+            value = value.repeat_interleave(h_q // total_heads_k, dim=0)
+
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * softmax_scale
+
+        if indices is not None:
+            mask = _get_topk_mask(indices[batch_idx], key.size(-2))
+            attn_scores = attn_scores.masked_fill(mask.logical_not(), float("-inf"))
+        elif causal and query.size(1) > 1:
+            rows = torch.arange(0, s_q, device=device).unsqueeze(1)
+            cols = torch.arange(0, key.size(-2), device=device).unsqueeze(0)
+            causal_mask = cols > rows
+            attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+
+        lse_batch = torch.logsumexp(attn_scores, dim=-1)
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        output = torch.matmul(attn_weights, value)
+
+        lonely_mask = (lse_batch == float("-inf"))
+        if lonely_mask.any():
+            output = output.masked_fill(lonely_mask.unsqueeze(-1), 0.0)
+            lse_batch = lse_batch.masked_fill(lonely_mask, float("inf"))
+
+        out[batch_idx] = output.transpose(0, 1).to(dtype)
+        lse[batch_idx] = lse_batch
+
+    return out, lse
 
 
 def flash_mla_with_kvcache(
@@ -169,6 +283,19 @@ def flash_mla_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
+    force_fallback = os.getenv("FLASH_MLA_FORCE_FALLBACK", "0").lower() in {"1", "true", "yes"}
+    if force_fallback or FLASH_MLA_LOADED_VARIANT != "sm120":
+        return _fallback_flash_mla_with_kvcache(
+            q,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            softmax_scale,
+            causal,
+            indices,
+        )
+
     out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
         q,
         k_cache,
@@ -180,7 +307,7 @@ def flash_mla_with_kvcache(
         tile_scheduler_metadata,
         num_splits,
         is_fp8_kvcache,
-        indices
+        indices,
     )
     return out, softmax_lse
 

@@ -1,3 +1,4 @@
+import os
 import random
 
 import torch
@@ -171,14 +172,26 @@ if __name__ == "__main__":
     window = 0
     has_bwd = False
 
-    for (mean_sq, mean_sk) in [(4096, 4096), (8192, 8192)]:
-        for varlen in [False, True]:
-            for (h, h_k) in [(128, 128), (32, 4)]:
-                if h != h_k:
-                    has_bwd = False
-                else:
-                    has_bwd = True
-                for (d, dv) in [(128, 128), (192, 128)]:
-                    for causal in [False, True]:
-                        skip_correctness_check = mean_sq == 8192 and mean_sk == 8192 and h == 128
-                        test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, has_bwd, not skip_correctness_check)
+    mode = os.getenv("FLASH_MLA_TEST_MODE", "full").lower()
+
+    if mode == "smoke":
+        smoke_cases = [
+            (4096, 4096, False, 128, 128, 128, 128, False, True),
+            (2048, 2048, True, 128, 128, 192, 128, True, False),
+            (2048, 2048, True, 32, 4, 128, 128, False, False),
+        ]
+        for mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, check in smoke_cases:
+            has_bwd = h == h_k
+            test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, has_bwd, check)
+    else:
+        for (mean_sq, mean_sk) in [(4096, 4096), (8192, 8192)]:
+            for varlen in [False, True]:
+                for (h, h_k) in [(128, 128), (32, 4)]:
+                    if h != h_k:
+                        has_bwd = False
+                    else:
+                        has_bwd = True
+                    for (d, dv) in [(128, 128), (192, 128)]:
+                        for causal in [False, True]:
+                            skip_correctness_check = mean_sq == 8192 and mean_sk == 8192 and h == 128
+                            test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, has_bwd, not skip_correctness_check)

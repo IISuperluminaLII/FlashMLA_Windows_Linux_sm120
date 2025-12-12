@@ -1,0 +1,43 @@
+1:#include "../../../csrc/sm120/prefill/dense/sm120_kernel_traits.hpp"
+2:#include "../../../csrc/sm120/prefill/dense/kernel/sm120_fmha_fwd_kernel_tma_warpspecialized.hpp"
+3:#include "../../../csrc/sm120/prefill/dense/collective/sm100_fmha_mla_fwd_mainloop_tma_warpspecialized.hpp"
+4:#include "../../../csrc/sm120/prefill/dense/collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
+5:#include "../../../csrc/sm120/prefill/dense/kernel/fmha_tile_scheduler.hpp"
+6:
+7:using KernelTraits = flash::Sm120WorkstationConfig;
+8:using ProblemShape = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
+9:
+10:// Minimal Collective aliases matching sm120_fmha_fwd_kernel_tma_warpspecialized.hpp wiring
+11:using CollectiveMainloop = cutlass::fmha::collective::Sm100MlaFwdMainloopTmaWarpspecialized<
+12:    cutlass::bfloat16_t,
+13:    float,
+14:    float,
+15:    KernelTraits::TileShapeMlaFwd,
+16:    cute::tuple<int, cute::_1, cute::tuple<cute::tuple<int, int>, int>>,
+17:    cute::tuple<int, cute::_1, cute::tuple<cute::tuple<cute::_0, int>, int>>,
+18:    cute::tuple<int, cute::_1, cute::tuple<cute::tuple<cute::_0, int>, int>>,
+19:    cutlass::fmha::collective::CausalMask<false>,
+20:    KernelTraits::ThreadShape>;
+21:
+22:using CollectiveEpilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+23:    cutlass::bfloat16_t,
+24:    float,
+25:    KernelTraits::TileShapeMlaFwd,
+26:    cute::tuple<int, cute::_1, cute::tuple<cute::tuple<int, int>, int>>,
+27:    cute::tuple<cute::_1, cute::tuple<cute::tuple<int, int>, int>>,
+28:    cute::false_type>;
+29:
+30:using TileScheduler = cutlass::fmha::kernel::IndividualTileScheduler;
+31:
+32:using Kernel = cutlass::fmha::kernel::Sm120FmhaFwdKernelTmaWarpspecialized<
+33:    KernelTraits,
+34:    ProblemShape,
+35:    CollectiveMainloop,
+36:    CollectiveEpilogue,
+37:    TileScheduler>;
+38:
+39:// Compile-time guard: shared storage must not exceed kSharedMemLimit
+40:static_assert(Kernel::SharedStorageSize <= KernelTraits::kSharedMemLimit,
+41:              "SM120 forward shared memory exceeds limit");
+42:
+43:int main() { return 0; }
