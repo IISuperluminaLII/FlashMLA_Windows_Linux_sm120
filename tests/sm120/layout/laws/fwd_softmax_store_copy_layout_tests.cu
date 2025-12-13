@@ -44,11 +44,12 @@ __global__ void fwd_softmax_store_copy_compile() {
   auto tTMEM_STOREVrS =
       flash::detail::make_softmax_store_register<float>(tTMEM_STOREVcS);
 
-  // Verify tensor element counts match TMEM store atom requirements:
-  // - Register: 4 elements per thread (32 threads * 4 = 128 total)
-  // - TMEM: 128 elements (stride-0 means all threads see same addresses)
-  static_assert(cute::size(tTMEM_STOREVrS) == 4, "Register tensor: 4 elements per thread");
-  static_assert(cute::size(tTMEM_STOREVtS) == 128, "TMEM tensor: 128 elements total");
+  // Verify tensor element counts match TMEM store atom requirements (16dp32b8x):
+  // - Register: 8 elements per thread (8x atom = 8 registers/thread)
+  // - TMEM: 256 elements (V stats = 64 rows x 4 stats = 256 float elements)
+  // The 8x suffix means 8 register words per thread; 32 threads × 8 = 256 total
+  static_assert(cute::size(tTMEM_STOREVrS) == 8, "Register tensor: 8 elements per thread (8x atom)");
+  static_assert(cute::size(tTMEM_STOREVtS) == 256, "TMEM tensor: 256 elements (64 rows x 4 stats)");
 
   // Suppress unused warnings
   (void)tiled_tmem_storev;
