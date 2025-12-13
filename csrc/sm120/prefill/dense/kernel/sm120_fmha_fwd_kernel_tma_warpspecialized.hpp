@@ -166,7 +166,17 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
 
   using ClusterShape = typename CollectiveMainloop::ClusterShape;
 
+#if defined(FLASH_MLA_BUILD_SM120) && !defined(FLASH_MLA_SM120_USE_FP8)
+  // SM120 has no TMEM - use dummy allocator
+  struct TmemAllocatorSm120Noop {
+    CUTLASS_DEVICE void allocate(uint32_t, uint32_t*) {}
+    CUTLASS_DEVICE void free(uint32_t, uint32_t) {}
+    static constexpr uint32_t Sm100TmemCapacityColumns = 0;
+  };
+  using TmemAllocator = TmemAllocatorSm120Noop;
+#else
   using TmemAllocator = cute::TMEM::Allocator1Sm;
+#endif
 
   struct SharedStorage {
     using UnionType = union {
@@ -200,7 +210,9 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
       alignas(16) typename CollectiveMainloop::OrderBarrierSoftmax::SharedStorage order_s01;
     } pipelines;
 
+#if !defined(FLASH_MLA_BUILD_SM120) || defined(FLASH_MLA_SM120_USE_FP8)
     uint32_t tmem_base_ptr;
+#endif
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -417,7 +429,9 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
     typename CollectiveMainloop::OrderBarrierSoftmax order_s01(
       shared_storage.pipelines.order_s01, params_order_s01);
 
+#if !defined(FLASH_MLA_BUILD_SM120) || defined(FLASH_MLA_SM120_USE_FP8)
     TmemAllocator tmem_allocator;
+#endif
 
     __syncthreads();
 
@@ -534,8 +548,10 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
         static_assert(NumWarpsCorrection == 1);
 
         if (has_valid) {
+#if !defined(FLASH_MLA_BUILD_SM120) || defined(FLASH_MLA_SM120_USE_FP8)
           uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
           tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+#endif
         }
       }
 
@@ -557,8 +573,10 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
         }
 
         if (!allocated) {
+#if !defined(FLASH_MLA_BUILD_SM120) || defined(FLASH_MLA_SM120_USE_FP8)
           tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
           __syncwarp();
+#endif
           allocated = true;
         }
 
@@ -642,8 +660,10 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized {
       static_assert(NumWarpsEpilogue <= 1);
       if constexpr (NumWarpsEpilogue == 1) {
         if(has_valid) {
+#if !defined(FLASH_MLA_BUILD_SM120) || defined(FLASH_MLA_SM120_USE_FP8)
           uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
           tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+#endif
         }
       }
 

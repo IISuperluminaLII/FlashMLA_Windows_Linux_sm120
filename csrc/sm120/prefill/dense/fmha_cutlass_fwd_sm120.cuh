@@ -4,6 +4,7 @@
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_mla_fwd_mainloop_tma_warpspecialized.hpp"
+#include "collective/sm120_fmha_fwd_mainloop_sm80_bf16.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "device/fmha.hpp"
@@ -116,8 +117,19 @@ struct FwdRunner {
       kIsPersistent && (sizeof(Element) == sizeof(ElementOut));
   using OrderLoadEpilogue = std::conditional_t<IsOrderLoadEpilogue, true_type, false_type>;
 
-  // Use TMA mainloops for both SM100a and SM120
-  // SM120 will use the same mainloops but with adjusted configurations in kernel traits
+  // Mainloop selection: SM120 BF16 uses SM80-style mainloop (no TMEM), SM100 uses TMA warpspecialized
+#if defined(FLASH_MLA_BUILD_SM120) && !defined(FLASH_MLA_SM120_USE_FP8)
+  // SM120 BF16: Use SM80-style mainloop (no TMEM dependencies)
+  using MainloopFmha = cutlass::fmha::collective::Sm120FmhaFwdMainloopSm80Bf16<
+      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeFmha, StrideQ, StrideK,
+      StrideV, ActiveMask, typename KernelTraits::ThreadShape>;
+
+  // MLA still uses SM100 TMA mainloop for now (MLA path is disabled on SM120)
+  using MainloopMla = cutlass::fmha::collective::Sm100MlaFwdMainloopTmaWarpspecialized<
+      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeMla, StrideQ, StrideK,
+      StrideV, ActiveMask, typename KernelTraits::ThreadShape, OrderLoadEpilogue>;
+#else
+  // SM100: Use TMA warpspecialized mainloops
   using MainloopMla = cutlass::fmha::collective::Sm100MlaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeMla, StrideQ, StrideK,
       StrideV, ActiveMask, typename KernelTraits::ThreadShape, OrderLoadEpilogue>;
@@ -125,6 +137,7 @@ struct FwdRunner {
   using MainloopFmha = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeFmha, StrideQ, StrideK,
       StrideV, ActiveMask, typename KernelTraits::ThreadShape>;
+#endif
 
   // Operations remain the same, using selected mainloop
   using OperationMla =

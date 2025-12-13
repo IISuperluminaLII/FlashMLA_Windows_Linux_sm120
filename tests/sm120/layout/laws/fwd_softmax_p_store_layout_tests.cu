@@ -6,8 +6,9 @@
 #include "../../../../csrc/sm120/prefill/dense/sm120_kernel_traits.hpp"
 #include "../../../../csrc/sm120/prefill/dense/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
 
-// Compile-time guard: P-buffer TMEM store views must use the Copy_Traits
-// layouts required by SM100_TMEM_STORE_32dp32b16x for SM120 small tiles.
+// Compile-time guard: P-buffer TMEM store views use explicit ValID-derived layouts
+// (H1 approach) that match coalesce(upcast<32>(ValID)) for TMEM_STORE_P atom.
+// P-buffer: 64x16 = 1024 elements for SM120 small tiles.
 __global__ void fwd_softmax_p_store_layout_compile() {
   using TileShapeQK = flash::Sm120WorkstationConfig::TileShapeFmhaFwd;
   using StrideQ = cute::tuple<int, cute::_1, cute::tuple<cute::tuple<int, int>, int>>;
@@ -31,10 +32,19 @@ __global__ void fwd_softmax_p_store_layout_compile() {
   (void)tStS_load;
   (void)tScS_load;
 
-  using StoreTraits = cute::Copy_Traits<cute::SM100_TMEM_STORE_32dp32b16x>;
+  // H1 approach: P-buffer tensors have explicit ValID-derived layouts
+  // - tStS_P has PLayoutTmem = coalesce(upcast<32>(TMEM_STORE_P::ValID))
+  // - tScS_P has PLayoutReg = make_layout(shape(PLayoutTmem))
+  using PLayoutTmem = typename Mainloop::PLayoutTmem;
+  using PLayoutReg = typename Mainloop::PLayoutReg;
 
-  static_assert(std::is_same_v<decltype(tStS_P.layout()), typename StoreTraits::DstLayout>);
-  static_assert(std::is_same_v<decltype(tScS_P.layout()), typename StoreTraits::SrcLayout>);
+  static_assert(std::is_same_v<decltype(tStS_P.layout()), PLayoutTmem>,
+                "P-buffer TMEM tensor must use PLayoutTmem (ValID-derived)");
+  static_assert(std::is_same_v<decltype(tScS_P.layout()), PLayoutReg>,
+                "P-buffer register tensor must use PLayoutReg (contiguous)");
+
+  // Verify P-buffer has correct element count: 64x16 = 1024 elements
+  static_assert(cute::size(PLayoutTmem{}) == 1024, "P-buffer: 64 rows x 16 cols = 1024 elements");
 }
 
 int main() {

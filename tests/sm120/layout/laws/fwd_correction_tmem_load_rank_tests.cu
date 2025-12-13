@@ -23,9 +23,13 @@ using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecializ
 __global__ void fwd_correction_tmem_load_rank_compile() {}
 
 int main() {
+  // V stats buffer: 64 rows × 4 stats = 256 float elements
+  // Uses 16dp (16 rows/warp × 4 warps = 64 rows) and 8x (256 elements/copy)
   static_assert(std::is_same_v<typename Mainloop::TMEM_LOAD_V,
-                               cute::SM100_TMEM_LOAD_16dp32b16x>);
+                               cute::SM100_TMEM_LOAD_16dp32b8x>,
+                "V stats uses 16dp32b8x for 256 element copies (64 rows × 4 stats)");
   static_assert(std::is_same_v<typename Mainloop::TMEM_STORE_V,
-                               cute::SM100_TMEM_STORE_16dp32b16x>);
+                               cute::SM100_TMEM_STORE_16dp32b8x>,
+                "V stats uses 16dp32b8x for 256 element copies (64 rows × 4 stats)");
   return 0;
 }
