@@ -225,30 +225,41 @@ Build for SM120 workstation GPUs with optimized memory usage (99KB shared memory
 rm -rf build flash_mla.egg-info
 
 # Set environment variables
-export NVCC_THREADS=32
-export FLASH_MLA_DISABLE_SM90=1
-export FLASH_MLA_DISABLE_SM100=1
+set FLASH_MLA_ARCH=sm120   # Windows
+export FLASH_MLA_ARCH=sm120  # Linux/macOS
 
-# Build
-python setup.py build_ext --inplace
+# Build (applies CUTLASS patches automatically)
+pip install -v .
 ```
 
-This build includes **full training support** with the following memory optimizations:
-- **kStages=2** (CUTLASS minimum requirement)
-- **Minimum CUTLASS-compliant tiles**: Q=128, K=128, DQK=16, DVO=16
-- **Buffer sharing**: smem_v union smem_dq (saves ~20KB)
-- **Non-persistent scheduler**: UnionType storage (saves ~16KB)
-- **Reduced pipeline stages**: kStagesReduceTmaStore=1
-
-**Total memory savings**: ~36-40KB from SM100a baseline, fitting within 99KB limit
+**Build-time Patching**: The build system automatically patches CUTLASS to provide no-op fallbacks for TMEM (Tensor Memory) operations. TMEM is a datacenter-only feature (SM100/101/103) not available on SM120 workstation GPUs. Patches are located in `patches/` and applied idempotently at build time.
 
 **Supported GPUs**:
 - NVIDIA RTX 6000 Pro Blackwell Workstation Edition
 - NVIDIA GeForce RTX 5090 / 5080 / 5070 (upcoming)
 
 **What's Included**:
-- Dense MHA prefill kernels (forward + backward) - **FULL TRAINING SUPPORT**
-- All memory-optimized for 99KB shared memory limit
+- **Dense MLA Decoding** - WMMA-accelerated kernel with batch-parallel scheduling
+  - Uses WMMA 16x16x16 tensor core operations (SM80-compatible, no GMMA/TCGEN05)
+  - Tiled Q processing: [64, 64] tiles instead of full [64, 576] to fit 99KB
+  - Batch-parallel grid: `(num_m_blocks, h_k, batch_size)` for full SM utilization
+  - ~32x speedup over PyTorch manual attention baseline
+- **Dense MHA Prefill** (forward) - ATen fallback for training
+- **Sparse MLA Prefill** - Full support
+
+**Performance** (RTX 6000 Pro, batch=128, seqlen=8192):
+```
+FlashMLA SM120 Decode: ~3.7ms
+PyTorch Manual Attn:   ~120ms
+Speedup: ~32x
+```
+
+**Memory Optimizations for Prefill**:
+- **kStages=2** (CUTLASS minimum requirement)
+- **Minimum CUTLASS-compliant tiles**: Q=128, K=128, DQK=16, DVO=16
+- **Buffer sharing**: smem_v union smem_dq (saves ~20KB)
+- **Non-persistent scheduler**: UnionType storage (saves ~16KB)
+- **Reduced pipeline stages**: kStagesReduceTmaStore=1
 
 ### Verification
 
@@ -271,9 +282,22 @@ if torch.cuda.is_available():
 
 ### Key Files Modified for SM120 Support
 
-- `csrc/sm100/prefill/dense/sm100_kernel_traits.hpp` - Added Sm120WorkstationConfig with memory optimizations
-- `csrc/sm100/prefill/dense/kernel/sm100_fmha_bwd_mla_kernel_tma_warpspecialized.hpp` - Implemented buffer sharing (smem_v union smem_dq)
-- `setup.py` - Added conditional compilation for SM100a/SM120 variants
+**Decode Kernel (new)**:
+- `csrc/sm120/decode/dense/splitkv_mla.cu` - WMMA-accelerated MLA decode kernel
+- `csrc/sm120/decode/dense/config.h` - SM120 configuration (99KB shared memory)
+- `csrc/sm120/decode/dense/traits.h` - CuTe layouts and shared memory plan
+- `csrc/sm120/decode/dense/params.h` - MSVC-safe parameter structures
+- `csrc/sm120/decode/dense/helpers.h` - WMMA helper functions
+
+**Prefill Kernel**:
+- `csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu` - ATen fallback for backward pass
+
+**Build System**:
+- `setup.py` - Build-time CUTLASS patching for TMEM fallback
+- `patches/cutlass_tmem_sm120_fallback.patch` - TMEM no-op patch for SM120
+
+**Benchmark**:
+- `benchmark/triton/__init__.py` - Fixed CUDA synchronization for accurate timing
 
 ## Acknowledgement
 
