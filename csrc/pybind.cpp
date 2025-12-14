@@ -72,9 +72,165 @@ void FLASH_MLA_DENSE_BWD_RUN(at::Tensor workspace_buffer, at::Tensor d_o, at::Te
 #include "sm100/prefill/sparse/fwd.h"
 #endif
 
+// SM120 decode kernel (CUTLASS with SM80 MMA atoms)
+#if defined(FLASH_MLA_BUILD_SM120)
+#include "sm120/decode/dense/splitkv_mla.h"
+#endif
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == c10::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+// SM120 decode fallback - ATen-based implementation for workstation GPUs
+// that lack TMA/TMEM support required by native CUTLASS kernels
+#if defined(FLASH_MLA_BUILD_SM120)
+namespace sm120_fallback {
+
+// Gather KV cache from paged blocks into contiguous tensors
+inline std::tuple<at::Tensor, at::Tensor> gather_kv_from_paged_cache(
+    const at::Tensor& kcache,
+    const at::Tensor& block_table,
+    const at::Tensor& seqlens_k,
+    int batch_size,
+    int head_size_k,
+    int head_size_v,
+    int page_block_size,
+    int num_heads_k) {
+  // kcache shape: [num_blocks, page_block_size, num_heads_k, head_size_k]
+  // block_table: [batch_size, max_num_blocks_per_seq]
+  // Returns: K [batch, max_seqlen, num_heads_k, head_size_k]
+  //          V [batch, max_seqlen, num_heads_k, head_size_v]
+
+  auto seqlens_cpu = seqlens_k.to(at::kCPU);
+  int* seqlens_ptr = seqlens_cpu.data_ptr<int>();
+  int max_seqlen = 0;
+  for (int b = 0; b < batch_size; b++) {
+    max_seqlen = std::max(max_seqlen, seqlens_ptr[b]);
+  }
+
+  auto block_table_cpu = block_table.to(at::kCPU);
+  int* block_table_ptr = block_table_cpu.data_ptr<int>();
+  int max_blocks_per_seq = block_table.size(1);
+
+  auto opts = kcache.options();
+  at::Tensor k_out = at::zeros({batch_size, max_seqlen, num_heads_k, head_size_k}, opts);
+  at::Tensor v_out = at::zeros({batch_size, max_seqlen, num_heads_k, head_size_v}, opts);
+
+  // Gather K and V from paged cache
+  for (int b = 0; b < batch_size; b++) {
+    int seqlen = seqlens_ptr[b];
+    int num_blocks = (seqlen + page_block_size - 1) / page_block_size;
+
+    for (int blk_idx = 0; blk_idx < num_blocks; blk_idx++) {
+      int block_id = block_table_ptr[b * max_blocks_per_seq + blk_idx];
+      int start_pos = blk_idx * page_block_size;
+      int end_pos = std::min(start_pos + page_block_size, seqlen);
+      int tokens_in_block = end_pos - start_pos;
+
+      // kcache[block_id, :tokens_in_block, :, :head_size_k] -> k_out[b, start_pos:end_pos, :, :]
+      at::Tensor k_block = kcache.index({block_id}).slice(0, 0, tokens_in_block);
+      k_out.index_put_({b, at::indexing::Slice(start_pos, end_pos)},
+                       k_block.slice(-1, 0, head_size_k));
+
+      // For V, use last head_size_v dimensions (MLA layout)
+      v_out.index_put_({b, at::indexing::Slice(start_pos, end_pos)},
+                       k_block.slice(-1, head_size_k - head_size_v, head_size_k));
+    }
+  }
+
+  return {k_out, v_out};
+}
+
+// ATen-based scaled dot-product attention fallback
+inline std::tuple<at::Tensor, at::Tensor> run_decode_fallback(
+    at::Tensor& q,                    // [batch, q_seq_per_hk, num_heads, head_size_k]
+    const at::Tensor& kcache,         // paged cache
+    const at::Tensor& seqlens_k,
+    const at::Tensor& block_table,
+    float softmax_scale,
+    bool is_causal,
+    int head_size_v,
+    int page_block_size,
+    int num_heads_k) {
+
+  int batch_size = q.size(0);
+  int q_seq = q.size(1);
+  int num_heads = q.size(2);
+  int head_size_k = q.size(3);
+
+  // Gather K and V from paged cache
+  auto [k_gathered, v_gathered] = gather_kv_from_paged_cache(
+      kcache, block_table, seqlens_k, batch_size,
+      head_size_k, head_size_v, page_block_size, num_heads_k);
+
+  // k_gathered: [batch, max_seqlen, num_heads_k, head_size_k]
+  // v_gathered: [batch, max_seqlen, num_heads_k, head_size_v]
+
+  auto seqlens_cpu = seqlens_k.to(at::kCPU);
+  int* seqlens_ptr = seqlens_cpu.data_ptr<int>();
+  int max_seqlen = k_gathered.size(1);
+
+  auto opts = q.options();
+  at::Tensor out = at::zeros({batch_size, q_seq, num_heads, head_size_v}, opts);
+  at::Tensor lse = at::zeros({batch_size, num_heads, q_seq}, opts.dtype(at::kFloat));
+
+  // Convert to float for numerical stability
+  at::Tensor q_float = q.to(at::kFloat);
+  at::Tensor k_float = k_gathered.to(at::kFloat);
+  at::Tensor v_float = v_gathered.to(at::kFloat);
+
+  int num_heads_per_kv = num_heads / num_heads_k;
+
+  for (int b = 0; b < batch_size; b++) {
+    int kv_len = seqlens_ptr[b];
+    if (kv_len == 0) continue;
+
+    // q: [q_seq, num_heads, head_size_k]
+    at::Tensor q_b = q_float.index({b});
+
+    // k, v: [kv_len, num_heads_k, head_size]
+    at::Tensor k_b = k_float.index({b}).slice(0, 0, kv_len);
+    at::Tensor v_b = v_float.index({b}).slice(0, 0, kv_len);
+
+    for (int h = 0; h < num_heads; h++) {
+      int kv_head = h / num_heads_per_kv;
+
+      // q_h: [q_seq, head_size_k]
+      at::Tensor q_h = q_b.select(1, h);
+
+      // k_h: [kv_len, head_size_k], v_h: [kv_len, head_size_v]
+      at::Tensor k_h = k_b.select(1, kv_head);
+      at::Tensor v_h = v_b.select(1, kv_head);
+
+      // scores: [q_seq, kv_len]
+      at::Tensor scores = at::matmul(q_h, k_h.transpose(0, 1)) * softmax_scale;
+
+      // Apply causal mask if needed
+      if (is_causal && q_seq > 1) {
+        at::Tensor row_idx = at::arange(0, q_seq, scores.options().dtype(at::kLong)).unsqueeze(1);
+        at::Tensor col_idx = at::arange(0, kv_len, scores.options().dtype(at::kLong)).unsqueeze(0);
+        // For decode, typically q_seq==1, but handle general case
+        at::Tensor mask = col_idx > (row_idx + kv_len - q_seq);
+        scores.masked_fill_(mask, -std::numeric_limits<float>::infinity());
+      }
+
+      // Compute softmax
+      at::Tensor lse_h = at::logsumexp(scores, -1, true);
+      at::Tensor probs = (scores - lse_h).exp();
+
+      // Output: [q_seq, head_size_v]
+      at::Tensor out_h = at::matmul(probs, v_h);
+
+      out.index_put_({b, at::indexing::Slice(), h}, out_h.to(opts.dtype()));
+      lse.index_put_({b, h}, lse_h.squeeze(-1));
+    }
+  }
+
+  return {out, lse};
+}
+
+}  // namespace sm120_fallback
+#endif  // FLASH_MLA_BUILD_SM120
 
 struct Arch {
     int major;
@@ -198,6 +354,24 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100/SM120");
             }
         }
+    } else
+#endif
+#if defined(FLASH_MLA_BUILD_SM120)
+    // SM120 CUTLASS path - single partition (no split-K) for now
+    // TODO: Implement split-K support in SM120 kernel to enable proper parallelization.
+    // The kernel currently writes directly to output buffers, not accumulator buffers.
+    // Split-K would require: (1) writing to oaccum_ptr/softmax_lseaccum_ptr, (2) proper
+    // partition index handling for batch/block assignment.
+    if (arch.is_sm120()) {
+        // SM120 CUTLASS kernel supports dense BF16/FP16 (no FP8, no sparse)
+        TORCH_CHECK(!is_fp8_kvcache, "SM120 CUTLASS does not support FP8 KV cache.");
+        TORCH_CHECK(!is_sparse_attn, "SM120 CUTLASS does not support sparse attention.");
+        // Single partition mode - kernel handles all batches sequentially
+        return {
+            1,   // num_sm_parts (single partition - no split-K support yet)
+            5,   // fixed_overhead_num_blocks
+            64   // k_block_size
+        };
     } else
 #endif
     {
@@ -448,6 +622,78 @@ fwd_kvcache_mla(
     if (arch.is_blackwell()) {
         TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100/SM120");
         sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+    } else
+#endif
+#if defined(FLASH_MLA_BUILD_SM120)
+    // SM120 CUTLASS path - uses SM80 MMA atoms for decode
+    if (arch.is_sm120()) {
+        // SM120 CUTLASS kernel supports BF16/FP16 dense attention
+        TORCH_CHECK(!is_fp8, "SM120 CUTLASS does not support FP8 KV cache. Use BF16/FP16.");
+        TORCH_CHECK(!is_sparse_attn, "SM120 CUTLASS does not support sparse attention.");
+        TORCH_CHECK(q_dtype == c10::kBFloat16 || q_dtype == c10::kHalf,
+                    "SM120 CUTLASS requires BF16 or FP16 query tensor.");
+
+        // Populate SM120 decode params
+        sm120::DecodingParams sm120_params;
+        sm120_params.b = batch_size;
+        sm120_params.h_k = num_heads_k;
+        sm120_params.h_q = num_heads_q;
+        sm120_params.q_head_per_hk = num_q_heads_per_hk;
+        sm120_params.q_seq_per_hk = q_seq_per_hk;
+        sm120_params.s_q = seqlen_q_ori;
+        sm120_params.d = head_size_k;
+        sm120_params.d_v = head_size_v;
+        sm120_params.num_blocks = kcache.size(0);
+
+        sm120_params.q_ptr = q.data_ptr();
+        sm120_params.k_ptr = kcache.data_ptr();
+        sm120_params.o_ptr = out.data_ptr();
+        sm120_params.softmax_lse_ptr = softmax_lse.data_ptr();
+        sm120_params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+
+        // Note: Q has been reshaped from [batch, s_q, h_q, d] to [batch, q_seq_per_hk, h_kv, d]
+        // by the view/transpose/reshape on lines 504-505 above. Use strides of reshaped tensor.
+        sm120_params.q_batch_stride = q.stride(0);
+        sm120_params.q_row_stride = q.stride(-3);   // stride for q_seq_per_hk dim
+        sm120_params.q_head_stride = q.stride(-2);  // stride for h_kv dim
+        sm120_params.k_batch_stride = kcache.stride(0);
+        sm120_params.k_row_stride = kcache.stride(1);
+        sm120_params.k_head_stride = kcache.stride(2);
+        // Output has shape [batch, q_seq_per_hk, h_kv, d_v], same layout as reshaped Q
+        sm120_params.o_batch_stride = out.stride(0);
+        sm120_params.o_row_stride = out.stride(-3);
+        sm120_params.o_head_stride = out.stride(-2);
+
+        sm120_params.block_table = block_table.data_ptr<int>();
+        sm120_params.block_table_batch_stride = block_table.stride(0);
+        sm120_params.page_block_size = page_block_size;
+
+        sm120_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+        sm120_params.num_sm_parts = tile_scheduler_metadata.size(0);
+        sm120_params.num_splits_ptr = num_splits.data_ptr<int>();
+
+        sm120_params.total_num_splits = total_num_splits;
+        sm120_params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        sm120_params.oaccum_ptr = out_accum.data_ptr();
+
+        sm120_params.scale_softmax = softmax_scale;
+        sm120_params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
+        sm120_params.is_causal = is_causal;
+
+        sm120_params.indices_ptr = nullptr;
+        sm120_params.indices_batch_stride = 0;
+        sm120_params.indices_row_stride = 0;
+        sm120_params.topk = 0;
+
+        // Run SM120 CUTLASS decode kernel (non-templated wrappers for MSVC compatibility)
+        if (q_dtype == c10::kBFloat16) {
+            sm120::run_flash_splitkv_mla_kernel_bf16(sm120_params, stream);
+        } else if (q_dtype == c10::kHalf) {
+#ifndef FLASH_MLA_DISABLE_FP16
+            sm120::run_flash_splitkv_mla_kernel_fp16(sm120_params, stream);
+#endif
+        }
+        // Continue to combine kernel below
     } else
 #endif
     {

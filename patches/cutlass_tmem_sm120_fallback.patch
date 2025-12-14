@@ -1,0 +1,64 @@
+--- a/csrc/cutlass/include/cute/arch/tmem_allocator_sm100.hpp
++++ b/csrc/cutlass/include/cute/arch/tmem_allocator_sm100.hpp
+@@ -81,7 +81,9 @@ public:
+       :
+       : "r"(dst_intptr), "r"(num_columns));
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM (only SM100/101/103 datacenter)
++    (void)num_columns;
++    if (dst_ptr) *dst_ptr = 0;
+   #endif
+   }
+
+@@ -96,7 +98,9 @@ public:
+       :
+       : "r"(tmem_ptr), "r"(num_columns));
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM - no-op
++    (void)tmem_ptr;
++    (void)num_columns;
+   #endif
+   }
+
+@@ -105,7 +109,7 @@ public:
+   #if defined(CUTE_ARCH_TCGEN05_TMEM_ENABLED)
+     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::);
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM - no-op
+   #endif
+   }
+ };
+@@ -140,7 +144,9 @@ public:
+       :
+       : "r"(dst_intptr), "r"(num_columns));
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM (only SM100/101/103 datacenter)
++    (void)num_columns;
++    if (dst_ptr) *dst_ptr = 0;
+   #endif
+   }
+
+@@ -163,7 +169,9 @@ public:
+       :
+       : "r"(tmem_ptr), "r"(num_columns));
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM - no-op
++    (void)tmem_ptr;
++    (void)num_columns;
+   #endif
+   }
+
+@@ -173,7 +181,7 @@ public:
+   #if defined(CUTE_ARCH_TCGEN05_TMEM_ENABLED)
+     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;" ::);
+   #else
+-    CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");
++    // SM120 workstation GPUs do not have TMEM - no-op
+   #endif
+   }
+ };

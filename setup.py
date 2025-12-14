@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +13,80 @@ from torch.utils.cpp_extension import (
     CUDA_HOME,
 )
 
+
+def apply_patches():
+    """Apply patches to CUTLASS and other dependencies at build time.
+
+    SM120 workstation GPUs (RTX 6000 Pro, RTX 50 series) do not have TMEM
+    (Tensor Memory), which is a datacenter-only feature (SM100/101/103).
+    CUTLASS 4.2.1 crashes when TMEM is used on SM120, so we patch it to
+    no-op the TMEM allocator calls.
+    """
+    this_dir = Path(__file__).resolve().parent
+    patches_dir = this_dir / "patches"
+
+    if not patches_dir.exists():
+        return
+
+    for patch_file in patches_dir.glob("*.patch"):
+        print(f"[build] Checking patch: {patch_file.name}")
+
+        # Parse patch to get target file and apply in-memory replacement
+        if patch_file.name == "cutlass_tmem_sm120_fallback.patch":
+            target_file = this_dir / "csrc" / "cutlass" / "include" / "cute" / "arch" / "tmem_allocator_sm100.hpp"
+            if not target_file.exists():
+                print(f"[build] WARNING: Patch target not found: {target_file}")
+                continue
+
+            content = target_file.read_text(encoding="utf-8")
+
+            # Check if already patched
+            if "SM120 workstation GPUs do not have TMEM" in content:
+                print(f"[build] Patch already applied: {patch_file.name}")
+                continue
+
+            # Apply the patch via string replacement
+            # Replace CUTE_INVALID_CONTROL_PATH in Allocator1Sm::allocate
+            old_allocate1 = 'CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");'
+            new_allocate1 = '''// SM120 workstation GPUs do not have TMEM (only SM100/101/103 datacenter)
+    (void)num_columns;
+    if (dst_ptr) *dst_ptr = 0;'''
+
+            # First occurrence is in allocate(), replace it
+            content = content.replace(old_allocate1, new_allocate1, 1)
+
+            # For free() and release_allocation_lock(), replace remaining occurrences
+            old_free = 'CUTE_INVALID_CONTROL_PATH("Attempting to use TMEM allocation PTX without CUTE_ARCH_TCGEN05_TMEM_ENABLED");'
+
+            # Count remaining occurrences
+            if old_free in content:
+                # Replace for free() - needs (void) casts
+                new_free = '''// SM120 workstation GPUs do not have TMEM - no-op
+    (void)tmem_ptr;
+    (void)num_columns;'''
+                content = content.replace(old_free, new_free, 1)
+
+            if old_free in content:
+                # Replace for release_allocation_lock() - simple no-op
+                new_release = "// SM120 workstation GPUs do not have TMEM - no-op"
+                content = content.replace(old_free, new_release, 1)
+
+            # Repeat for Allocator2Sm class (same pattern)
+            if old_allocate1 in content:
+                content = content.replace(old_allocate1, new_allocate1, 1)
+            if old_free in content:
+                content = content.replace(old_free, new_free, 1)
+            if old_free in content:
+                content = content.replace(old_free, new_release, 1)
+
+            target_file.write_text(content, encoding="utf-8")
+            print(f"[build] Applied patch: {patch_file.name}")
+
+
+# Apply patches before build starts
+apply_patches()
+
+
 SUPPORTED_ARCHES = {"sm100", "sm120"}
 
 
@@ -20,7 +95,7 @@ def is_flag_set(flag: str) -> bool:
 
 
 def resolve_target_arch() -> str:
-    target = os.getenv("FLASH_MLA_ARCH", "sm100").lower()
+    target = os.getenv("FLASH_MLA_ARCH", "sm100").strip().lower()
     if target not in SUPPORTED_ARCHES:
         raise ValueError(
             f"Unsupported FLASH_MLA_ARCH='{target}'. Expected one of {sorted(SUPPORTED_ARCHES)}."
@@ -121,6 +196,7 @@ VARIANTS = {
         "sources": [
             "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
             "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
+            "csrc/sm120/decode/dense/splitkv_mla.cu",
         ],
         "defines": [
             "FLASH_MLA_BUILD_SM120",
