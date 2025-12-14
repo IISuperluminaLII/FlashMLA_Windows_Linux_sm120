@@ -2,19 +2,26 @@ import sys
 import time
 from types import ModuleType, SimpleNamespace
 
+import torch
+
 
 class _Testing:
     def do_bench(self, fn, rep=50, warmup=10):
         """Lightweight replacement for triton.testing.do_bench.
 
         Returns average latency in milliseconds across `rep` runs after an optional warmup.
+        IMPORTANT: Uses torch.cuda.synchronize() to measure actual kernel execution time,
+        not just kernel launch latency.
         """
+        # Warmup with sync
         for _ in range(max(0, warmup)):
             fn()
+        torch.cuda.synchronize()
 
         start = time.perf_counter()
         for _ in range(max(1, rep)):
             fn()
+        torch.cuda.synchronize()  # Wait for all GPU work to complete
         end = time.perf_counter()
 
         return (end - start) * 1000.0 / max(1, rep)

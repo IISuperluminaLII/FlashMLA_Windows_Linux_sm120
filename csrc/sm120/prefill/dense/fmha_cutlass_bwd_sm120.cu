@@ -21,7 +21,24 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
 
-#ifdef FLASH_MLA_FORCE_BWD_FALLBACK
+  // SM120 uses fallback implementation due to TMEM/TMA constraints
+  // SM120 (Blackwell workstation GPUs) does NOT have TMEM or TCGEN05/UMMA
+  // which are datacenter-only features (SM100). Use ATen fallback instead.
+  int device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  const int sm_version = prop.major * 10 + prop.minor;
+
+  TORCH_CHECK(
+      sm_version >= 120 && sm_version < 130,
+      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
+      prop.major,
+      prop.minor,
+      ". Please install the SM100 build for server parts.");
+
+  // Use fallback for all SM120 configurations - the CUTLASS backward mainloop
+  // has TMA/TMEM dependencies that SM120 doesn't support
   const auto stream = c10::cuda::getCurrentCUDAStream();
   flash::detail::run_fmha_bwd_sm120_fallback<IsVarlen, IsMla, Mask>(
       stream,
@@ -39,30 +56,6 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       softmax_scale,
       max_seqlen_q,
       total_seqlen_kv);
-  return;
-#else
-  int device = 0;
-  cudaGetDevice(&device);
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device);
-  const int sm_version = prop.major * 10 + prop.minor;
-
-  TORCH_CHECK(
-      sm_version >= 120 && sm_version < 130,
-      "flash_mla_sm120 build only supports SM120-class GPUs. Detected sm_",
-      prop.major,
-      prop.minor,
-      ". Please install the SM100 build for server parts.");
-
-  using TileShape = std::conditional_t<IsMla,
-                                       typename flash::Sm120WorkstationConfig::TileShapeMlaBwd,
-                                       typename flash::Sm120WorkstationConfig::TileShapeFmhaBwd>;
-  run_fmha_bwd<flash::Sm120WorkstationConfig, Element, IsVarlen, IsMla, TileShape, Mask>(
-      workspace_buffer, d_o, q, k, v, o, lse,
-      cumulative_seqlen_q, cumulative_seqlen_kv,
-      dq, dk, dv,
-      softmax_scale, max_seqlen_q, total_seqlen_kv);
-#endif
 }
 
 
