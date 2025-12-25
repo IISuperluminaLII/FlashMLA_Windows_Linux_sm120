@@ -10,15 +10,16 @@ Status:
 | Dense Decode       | WORKING  | `splitkv_mla.cu`            |
 | Dense Prefill Fwd  | WORKING  | `fmha_cutlass_fwd_sm120.cu` |
 | Dense Prefill Bwd  | WORKING  | `fmha_cutlass_bwd_sm120.cu` |
+| Sparse Prefill     | WIP      | `"WIP"`                     |
 
 ## NOT Implemented (Sparse)
 
 | Kernel         | Status        | Error                                           |
 |----------------|---------------|-------------------------------------------------|
 | Sparse Decode  | NOT SUPPORTED | `"FlashMLA sparse decode kernels are disabled"` |
-| Sparse Prefill | NOT SUPPORTED | `"Only supported on SM90 or SM100"`             |
+| Sparse Prefill | NOT SUPPORTED | `"WIP"`                                         |
 
-## Why Sparse is Missing on SM120
+## Why Sparse DECODE is Missing on SM120
 
 SM120 (Blackwell GeForce/Workstation) lacks the **GMMA/TCGEN05** instructions needed for CUTLASS sparse attention. Only **SM90 (Hopper)** and **SM100 (Blackwell Data Center)** have the required sparse tensor core support.
 
