@@ -1,18 +1,36 @@
 Status:
 
-external\\FlashMLA\\flash_mla\\cuda_sm120.cp312-win_amd64.pyd'>
-Functions: ['dense_prefill_bwd', 'dense_prefill_fwd', 'fwd', 'fwd_kvcache_mla', 'get_mla_decoding_metadata', 'sparse_prefill_fwd']
 
-Suace:
-SM120: TileShape = (64, 16, 128), ThreadShape = (1, 1, 1)
-TileShapeQK = (64/1, 16/1, 128/1) = (64, 16, 128)
-TileShapeQK.M = 64 rows per stage
-16dp atoms handle 16 × 4 = 64 rows
+# SM120 FlashMLA Implementation Status
 
-SM100: TileShape = (128, 128, 128), ThreadShape = (2, 1, 1)
-TileShapeQK = (64, 128, 128)
-TileShapeQK.M = 64 rows per stage
-16dp atoms handle 64 rows
+## Currently Implemented (DENSE only)
+
+| Kernel             | Status   | Path                        |
+|--------------------|----------|-----------------------------|
+| Dense Decode       | WORKING  | `splitkv_mla.cu`            |
+| Dense Prefill Fwd  | WORKING  | `fmha_cutlass_fwd_sm120.cu` |
+| Dense Prefill Bwd  | WORKING  | `fmha_cutlass_bwd_sm120.cu` |
+
+## NOT Implemented (Sparse)
+
+| Kernel         | Status        | Error                                           |
+|----------------|---------------|-------------------------------------------------|
+| Sparse Decode  | NOT SUPPORTED | `"FlashMLA sparse decode kernels are disabled"` |
+| Sparse Prefill | NOT SUPPORTED | `"Only supported on SM90 or SM100"`             |
+
+## Why Sparse is Missing on SM120
+
+SM120 (Blackwell GeForce/Workstation) lacks the **GMMA/TCGEN05** instructions needed for CUTLASS sparse attention. Only **SM90 (Hopper)** and **SM100 (Blackwell Data Center)** have the required sparse tensor core support.
+
+## Architecture Comparison
+
+| Feature     | SM90 (H100) | SM100 (B200) | SM120                 |
+|-------------|-------------|--------------|-----------------------|
+| Dense MLA   | Yes         | Yes          | Yes                   |
+| Sparse MLA  | Yes (FP8)   | Yes (FP8)    | No                    |
+| GMMA        | Yes         | Yes          | No                    |
+| WMMA        | Yes         | Yes          | Yes                   |
+
 
 Also this is key for MSVC when converting any unix to linux: /Zc:__cplusplus
 
