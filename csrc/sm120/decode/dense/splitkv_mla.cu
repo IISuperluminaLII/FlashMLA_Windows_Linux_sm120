@@ -220,7 +220,7 @@ __device__ void wmma_gemm_pv_tiled(
 // - Fully utilizes all SMs for large batch sizes (e.g., 128 batches = 256 blocks)
 //==============================================================================
 template<typename T>
-__global__ void __launch_bounds__(T::NUM_THREADS, 1)
+__global__ void __launch_bounds__(T::NUM_THREADS, 2)  // Allow 2 CTAs per SM for better occupancy
 flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
     using InputT = typename T::InputT;
     using SmemLayoutQ_tile = typename T::SmemLayoutQ_tile;
@@ -280,8 +280,8 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             sScale[thread_idx] = 1.0f;
         }
 
-        // Zero output accumulator
-        #pragma unroll
+        // Zero output accumulator - limit unroll to reduce register pressure
+        #pragma unroll 8
         for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
             rO[i] = 0.0f;
         }
@@ -484,7 +484,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
 
             // Rescale previous output accumulator (flat layout)
             // Thread i owns output indices {i, i+256, i+512, ...}
-            #pragma unroll
+            #pragma unroll 8
             for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
                 int idx = thread_idx + i * T::NUM_THREADS;
                 int row = idx / T::HEAD_DIM_V;
@@ -555,7 +555,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
                 // All 256 threads read from sScores to accumulate their owned elements
                 const int tile_col_start = v_tile * V_TILE_DIM;
 
-                #pragma unroll
+                #pragma unroll 8
                 for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
                     // Flat layout: thread i owns indices {i, i+256, i+512, ...}
                     int global_out_idx = thread_idx + i * T::NUM_THREADS;
@@ -582,7 +582,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
         //==================================================================
         const int num_valid_seq_q = min(params.q_seq_per_hk - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
 
-        #pragma unroll
+        #pragma unroll 8
         for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
             int idx = thread_idx + i * T::NUM_THREADS;
             int row = idx / T::HEAD_DIM_V;

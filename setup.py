@@ -171,7 +171,7 @@ def get_arch_flags(target_arch: str):
 
 
 def get_nvcc_thread_args():
-    nvcc_threads = os.getenv("NVCC_THREADS") or "32"
+    nvcc_threads = (os.getenv("NVCC_THREADS") or "32").strip()
     return ["--threads", nvcc_threads]
 
 
@@ -196,6 +196,7 @@ VARIANTS = {
         "sources": [
             "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
             "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
+            "csrc/sm120/prefill/sparse/fwd.cu",
             "csrc/sm120/decode/dense/splitkv_mla.cu",
         ],
         "defines": [

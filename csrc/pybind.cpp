@@ -75,6 +75,7 @@ void FLASH_MLA_DENSE_BWD_RUN(at::Tensor workspace_buffer, at::Tensor d_o, at::Te
 // SM120 decode kernel (CUTLASS with SM80 MMA atoms)
 #if defined(FLASH_MLA_BUILD_SM120)
 #include "sm120/decode/dense/splitkv_mla.h"
+#include "sm120/prefill/sparse/fwd.h"
 #endif
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -736,8 +737,10 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
-    bool is_sm100 = dprops->major == 10;
-    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
+    bool is_sm100 = dprops->major == 10 && dprops->minor == 0;
+    bool is_sm120 = dprops->major == 12 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm100 || is_sm120,
+        "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90, SM100, or SM120 architectures");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(kv);
@@ -803,6 +806,11 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 #ifndef FLASH_MLA_DISABLE_SM100
     if (is_sm100) {
         sm100::run_fwd_kernel(params);
+    } else
+#endif
+#if defined(FLASH_MLA_BUILD_SM120)
+    if (is_sm120) {
+        sm120::run_sparse_fwd_kernel(params);
     } else
 #endif
     {
