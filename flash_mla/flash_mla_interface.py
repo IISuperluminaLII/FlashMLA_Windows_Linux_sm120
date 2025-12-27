@@ -342,6 +342,41 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_bwd(
+    d_o: torch.Tensor,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention prefill backward kernel (SM120 only)
+
+    Args:
+        d_o: [s_q, h_q, d_v], bfloat16 - gradient of output
+        q: [s_q, h_q, d_qk], bfloat16 - query tensor from forward
+        kv: [s_kv, h_kv, d_qk], bfloat16 - key-value tensor from forward
+        o: [s_q, h_q, d_v], bfloat16 - output tensor from forward
+        lse: [s_q, h_q], float32 - log-sum-exp from forward
+        indices: [s_q, h_kv, topk], int32 - sparse attention indices
+        sm_scale: float - softmax scale
+        d_v: The dimension of value vectors. Must be 512
+
+    Returns:
+        (dq, dk, dv)
+        - dq: [s_q, h_q, d_qk], bfloat16 - gradient of query
+        - dk: [s_kv, h_kv, d_qk], bfloat16 - gradient of key
+        - dv: [s_kv, h_kv, d_v], bfloat16 - gradient of value
+    """
+    results = flash_mla_cuda.sparse_prefill_bwd(
+        d_o, q, kv, o, lse, indices, sm_scale, d_v
+    )
+    return results
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

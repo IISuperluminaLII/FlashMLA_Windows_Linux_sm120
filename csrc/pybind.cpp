@@ -75,7 +75,9 @@ void FLASH_MLA_DENSE_BWD_RUN(at::Tensor workspace_buffer, at::Tensor d_o, at::Te
 // SM120 decode kernel (CUTLASS with SM80 MMA atoms)
 #if defined(FLASH_MLA_BUILD_SM120)
 #include "sm120/decode/dense/splitkv_mla.h"
+#include "sm120/decode/sparse_fp8/splitkv_mla.h"
 #include "sm120/prefill/sparse/fwd.h"
+#include "sm120/prefill/sparse/bwd.h"
 #endif
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -628,71 +630,119 @@ fwd_kvcache_mla(
 #if defined(FLASH_MLA_BUILD_SM120)
     // SM120 CUTLASS path - uses SM80 MMA atoms for decode
     if (arch.is_sm120()) {
-        // SM120 CUTLASS kernel supports BF16/FP16 dense attention
-        TORCH_CHECK(!is_fp8, "SM120 CUTLASS does not support FP8 KV cache. Use BF16/FP16.");
-        TORCH_CHECK(!is_sparse_attn, "SM120 CUTLASS does not support sparse attention.");
-        TORCH_CHECK(q_dtype == c10::kBFloat16 || q_dtype == c10::kHalf,
-                    "SM120 CUTLASS requires BF16 or FP16 query tensor.");
+        // SM120 supports both:
+        // - Dense BF16/FP16 attention
+        // - Sparse FP8 attention
+        if (is_sparse_attn && is_fp8) {
+            // Sparse FP8 decode path
+            TORCH_CHECK(q_dtype == c10::kBFloat16, "SM120 sparse FP8 decode requires BF16 queries");
 
-        // Populate SM120 decode params
-        sm120::DecodingParams sm120_params;
-        sm120_params.b = batch_size;
-        sm120_params.h_k = num_heads_k;
-        sm120_params.h_q = num_heads_q;
-        sm120_params.q_head_per_hk = num_q_heads_per_hk;
-        sm120_params.q_seq_per_hk = q_seq_per_hk;
-        sm120_params.s_q = seqlen_q_ori;
-        sm120_params.d = head_size_k;
-        sm120_params.d_v = head_size_v;
-        sm120_params.num_blocks = kcache.size(0);
+            sm120::sparse_decode::SparseFP8DecodeParams sparse_params;
+            sparse_params.batch_size = batch_size;
+            sparse_params.s_q = seqlen_q_ori;
+            sparse_params.h_q = num_heads_q;
+            sparse_params.h_kv = num_heads_k;
+            sparse_params.topk = topk;
+            sparse_params.page_size = page_block_size;
 
-        sm120_params.q_ptr = q.data_ptr();
-        sm120_params.k_ptr = kcache.data_ptr();
-        sm120_params.o_ptr = out.data_ptr();
-        sm120_params.softmax_lse_ptr = softmax_lse.data_ptr();
-        sm120_params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+            sparse_params.sm_scale = softmax_scale;
+            sparse_params.sm_scale_log2 = softmax_scale * float(M_LOG2E);
 
-        // Note: Q has been reshaped from [batch, s_q, h_q, d] to [batch, q_seq_per_hk, h_kv, d]
-        // by the view/transpose/reshape on lines 504-505 above. Use strides of reshaped tensor.
-        sm120_params.q_batch_stride = q.stride(0);
-        sm120_params.q_row_stride = q.stride(-3);   // stride for q_seq_per_hk dim
-        sm120_params.q_head_stride = q.stride(-2);  // stride for h_kv dim
-        sm120_params.k_batch_stride = kcache.stride(0);
-        sm120_params.k_row_stride = kcache.stride(1);
-        sm120_params.k_head_stride = kcache.stride(2);
-        // Output has shape [batch, q_seq_per_hk, h_kv, d_v], same layout as reshaped Q
-        sm120_params.o_batch_stride = out.stride(0);
-        sm120_params.o_row_stride = out.stride(-3);
-        sm120_params.o_head_stride = out.stride(-2);
+            sparse_params.q_ptr = (cutlass::bfloat16_t*)q.data_ptr();
+            sparse_params.kv_ptr = (cutlass::float_e4m3_t*)kcache.data_ptr();
+            sparse_params.indices_ptr = indices.value().data_ptr<int>();
+            sparse_params.block_table_ptr = block_table.data_ptr<int>();
+            sparse_params.seq_lens_ptr = seqlens_k.data_ptr<int>();
 
-        sm120_params.block_table = block_table.data_ptr<int>();
-        sm120_params.block_table_batch_stride = block_table.stride(0);
-        sm120_params.page_block_size = page_block_size;
+            sparse_params.q_batch_stride = q.stride(0);
+            sparse_params.q_seq_stride = q.stride(1);
+            sparse_params.q_head_stride = q.stride(2);
+            sparse_params.kv_page_stride = kcache.stride(0);
+            sparse_params.kv_token_stride = kcache.stride(1);
+            sparse_params.indices_batch_stride = indices.value().stride(0);
+            sparse_params.indices_seq_stride = indices.value().stride(1);
+            sparse_params.indices_head_stride = indices.value().stride(2);
 
-        sm120_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
-        sm120_params.num_sm_parts = tile_scheduler_metadata.size(0);
-        sm120_params.num_splits_ptr = num_splits.data_ptr<int>();
+            sparse_params.o_ptr = (cutlass::bfloat16_t*)out.data_ptr();
+            sparse_params.softmax_lse_ptr = (float*)softmax_lse.data_ptr();
+            sparse_params.o_batch_stride = out.stride(0);
+            sparse_params.o_seq_stride = out.stride(1);
+            sparse_params.o_head_stride = out.stride(2);
 
-        sm120_params.total_num_splits = total_num_splits;
-        sm120_params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-        sm120_params.oaccum_ptr = out_accum.data_ptr();
+            sparse_params.num_splits = 1;  // TODO: support split-KV
+            sparse_params.oaccum_ptr = nullptr;
+            sparse_params.lse_accum_ptr = nullptr;
 
-        sm120_params.scale_softmax = softmax_scale;
-        sm120_params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
-        sm120_params.is_causal = is_causal;
+            sparse_params.stream = stream;
 
-        sm120_params.indices_ptr = nullptr;
-        sm120_params.indices_batch_stride = 0;
-        sm120_params.indices_row_stride = 0;
-        sm120_params.topk = 0;
+            sm120::sparse_decode::run_sparse_fp8_decode_kernel(sparse_params);
+        } else {
+            // Dense BF16/FP16 decode path
+            TORCH_CHECK(!is_fp8, "SM120 dense decode does not support FP8 KV cache. Use BF16/FP16 or enable sparse.");
+            TORCH_CHECK(!is_sparse_attn, "SM120 dense decode does not support sparse attention. Enable FP8 for sparse.");
+            TORCH_CHECK(q_dtype == c10::kBFloat16 || q_dtype == c10::kHalf,
+                        "SM120 dense decode requires BF16 or FP16 query tensor.");
 
-        // Run SM120 CUTLASS decode kernel (non-templated wrappers for MSVC compatibility)
-        if (q_dtype == c10::kBFloat16) {
-            sm120::run_flash_splitkv_mla_kernel_bf16(sm120_params, stream);
-        } else if (q_dtype == c10::kHalf) {
+            // Populate SM120 decode params
+            sm120::DecodingParams sm120_params;
+            sm120_params.b = batch_size;
+            sm120_params.h_k = num_heads_k;
+            sm120_params.h_q = num_heads_q;
+            sm120_params.q_head_per_hk = num_q_heads_per_hk;
+            sm120_params.q_seq_per_hk = q_seq_per_hk;
+            sm120_params.s_q = seqlen_q_ori;
+            sm120_params.d = head_size_k;
+            sm120_params.d_v = head_size_v;
+            sm120_params.num_blocks = kcache.size(0);
+
+            sm120_params.q_ptr = q.data_ptr();
+            sm120_params.k_ptr = kcache.data_ptr();
+            sm120_params.o_ptr = out.data_ptr();
+            sm120_params.softmax_lse_ptr = softmax_lse.data_ptr();
+            sm120_params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+
+            // Note: Q has been reshaped from [batch, s_q, h_q, d] to [batch, q_seq_per_hk, h_kv, d]
+            // by the view/transpose/reshape on lines 504-505 above. Use strides of reshaped tensor.
+            sm120_params.q_batch_stride = q.stride(0);
+            sm120_params.q_row_stride = q.stride(-3);   // stride for q_seq_per_hk dim
+            sm120_params.q_head_stride = q.stride(-2);  // stride for h_kv dim
+            sm120_params.k_batch_stride = kcache.stride(0);
+            sm120_params.k_row_stride = kcache.stride(1);
+            sm120_params.k_head_stride = kcache.stride(2);
+            // Output has shape [batch, q_seq_per_hk, h_kv, d_v], same layout as reshaped Q
+            sm120_params.o_batch_stride = out.stride(0);
+            sm120_params.o_row_stride = out.stride(-3);
+            sm120_params.o_head_stride = out.stride(-2);
+
+            sm120_params.block_table = block_table.data_ptr<int>();
+            sm120_params.block_table_batch_stride = block_table.stride(0);
+            sm120_params.page_block_size = page_block_size;
+
+            sm120_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+            sm120_params.num_sm_parts = tile_scheduler_metadata.size(0);
+            sm120_params.num_splits_ptr = num_splits.data_ptr<int>();
+
+            sm120_params.total_num_splits = total_num_splits;
+            sm120_params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            sm120_params.oaccum_ptr = out_accum.data_ptr();
+
+            sm120_params.scale_softmax = softmax_scale;
+            sm120_params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
+            sm120_params.is_causal = is_causal;
+
+            sm120_params.indices_ptr = nullptr;
+            sm120_params.indices_batch_stride = 0;
+            sm120_params.indices_row_stride = 0;
+            sm120_params.topk = 0;
+
+            // Run SM120 CUTLASS decode kernel (non-templated wrappers for MSVC compatibility)
+            if (q_dtype == c10::kBFloat16) {
+                sm120::run_flash_splitkv_mla_kernel_bf16(sm120_params, stream);
+            } else if (q_dtype == c10::kHalf) {
 #ifndef FLASH_MLA_DISABLE_FP16
-            sm120::run_flash_splitkv_mla_kernel_fp16(sm120_params, stream);
+                sm120::run_flash_splitkv_mla_kernel_fp16(sm120_params, stream);
 #endif
+            }
         }
         // Continue to combine kernel below
     } else
@@ -821,6 +871,109 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     return {out, max_logits, lse};
 }
 
+// Sparse prefill backward kernel (SM120 only)
+std::vector<at::Tensor> sparse_prefill_bwd(
+    const at::Tensor &d_o,
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &o,
+    const at::Tensor &lse,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v
+) {
+#if !defined(FLASH_MLA_BUILD_SM120)
+    TORCH_CHECK(false, "Sparse prefill backward is only supported on SM120 builds");
+    return {};
+#else
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm120 = dprops->major == 12 && dprops->minor == 0;
+    TORCH_CHECK(is_sm120, "Sparse Attention Backward Kernel (sparse_prefill_bwd) is only supported on SM120");
+
+    CHECK_DEVICE(d_o);
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(kv);
+    CHECK_DEVICE(o);
+    CHECK_DEVICE(lse);
+    CHECK_DEVICE(indices);
+
+    TORCH_CHECK(d_o.dtype() == c10::kBFloat16);
+    TORCH_CHECK(q.dtype() == c10::kBFloat16);
+    TORCH_CHECK(kv.dtype() == c10::kBFloat16);
+    TORCH_CHECK(o.dtype() == c10::kBFloat16);
+    TORCH_CHECK(lse.dtype() == c10::kFloat);
+    TORCH_CHECK(indices.dtype() == c10::kInt);
+
+    int s_q = q.size(0);
+    int s_kv = kv.size(0);
+    int h_q = q.size(1);
+    int h_kv = kv.size(1);
+    int d_qk = q.size(2);
+    int topk = indices.size(2);
+
+    CHECK_SHAPE(q, s_q, h_q, d_qk);
+    CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
+    CHECK_SHAPE(o, s_q, h_q, d_v);
+    CHECK_SHAPE(d_o, s_q, h_q, d_v);
+    CHECK_SHAPE(lse, s_q, h_q);
+    CHECK_SHAPE(indices, s_q, h_kv, topk);
+
+    TORCH_CHECK(d_o.stride(-1) == 1);
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(kv.stride(-1) == 1);
+    TORCH_CHECK(o.stride(-1) == 1);
+    TORCH_CHECK(indices.stride(-1) == 1);
+
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    auto opts_f32 = opts.dtype(at::kFloat);
+
+    // Allocate output gradients
+    // dq is bf16 (written once per query, no atomics needed)
+    at::Tensor dq = at::zeros({s_q, h_q, d_qk}, opts);
+    // dk and dv use float32 for atomic accumulation (multiple queries write to same KV)
+    at::Tensor dk_f32 = at::zeros({s_kv, h_kv, d_qk}, opts_f32);
+    at::Tensor dv_f32 = at::zeros({s_kv, h_kv, d_v}, opts_f32);
+
+    sm120::SparsePrefillBwdParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        sm_scale, sm_scale * 1.44269504f,
+
+        (cutlass::bfloat16_t*)q.data_ptr(),
+        (cutlass::bfloat16_t*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        (cutlass::bfloat16_t*)o.data_ptr(),
+        (float*)lse.data_ptr(),
+
+        (cutlass::bfloat16_t*)d_o.data_ptr(),
+
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+        int64_stride_to_int(o.stride(0)), int64_stride_to_int(o.stride(1)),
+        int64_stride_to_int(d_o.stride(0)), int64_stride_to_int(d_o.stride(1)),
+
+        (cutlass::bfloat16_t*)dq.data_ptr(),
+        (float*)dk_f32.data_ptr(),
+        (float*)dv_f32.data_ptr(),
+
+        int64_stride_to_int(dq.stride(0)), int64_stride_to_int(dq.stride(1)),
+        int64_stride_to_int(dk_f32.stride(0)), int64_stride_to_int(dk_f32.stride(1)),
+        int64_stride_to_int(dv_f32.stride(0)), int64_stride_to_int(dv_f32.stride(1)),
+
+        at::cuda::getCurrentCUDAStream().stream()
+    };
+
+    sm120::run_sparse_bwd_kernel(params);
+
+    // Convert dk and dv from float32 to bf16 for output
+    at::Tensor dk = dk_f32.to(opts.dtype());
+    at::Tensor dv = dv_f32.to(opts.dtype());
+
+    return {dq, dk, dv};
+#endif
+}
+
 // Wrapper functions for dense kernels (support SM100a + SM120) with explicit Python bindings
 void dense_prefill_fwd_wrapper(
     at::Tensor workspace_buffer,
@@ -915,5 +1068,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_varlen")
     );
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+    m.def("sparse_prefill_bwd", &sparse_prefill_bwd);
     m.attr("__flash_mla_variant__") = kFlashMlaVariantName;
 }

@@ -197,7 +197,9 @@ VARIANTS = {
             "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
             "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
             "csrc/sm120/prefill/sparse/fwd.cu",
+            "csrc/sm120/prefill/sparse/bwd.cu",
             "csrc/sm120/decode/dense/splitkv_mla.cu",
+            "csrc/sm120/decode/sparse_fp8/splitkv_mla.cu",
         ],
         "defines": [
             "FLASH_MLA_BUILD_SM120",
