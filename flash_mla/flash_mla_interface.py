@@ -442,6 +442,17 @@ def _flash_attn_varlen_backward(
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # CRITICAL: All input tensors must be contiguous for correct memory layout
+    # The kernel expects [total_tokens, num_heads, head_dim] with strides [H*D, D, 1]
+    # Non-contiguous tensors (e.g., from permute()) have wrong strides and cause
+    # the kernel to read incorrect data (mixing heads and tokens)
+    do = do.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = out.contiguous()
+    lse = lse.contiguous()
+
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
 
@@ -526,6 +537,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     ):
         del dlse  # LSE doesn't support backward currently
         q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
+        # Contiguity is now handled in _flash_attn_varlen_backward
         dq, dk, dv = _flash_attn_varlen_backward(
             do, q, k, v, out, lse,
             cu_seqlens_qo, cu_seqlens_kv, ctx.max_seqlen_qo, ctx.max_seqlen_kv,

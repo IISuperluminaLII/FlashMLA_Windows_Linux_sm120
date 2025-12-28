@@ -9,6 +9,7 @@
 
 #include "sm120/prefill/dense/sm120_kernel_traits.hpp"
 #include "sm120/prefill/dense/fmha_cutlass_bwd_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_kernel_sm120.cuh"
 
 template<class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -20,10 +21,10 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
+  static constexpr bool IsCausal =
+      std::is_same_v<Mask, CausalForBackwardMask<false>> ||
+      std::is_same_v<Mask, CausalForBackwardMask<true>>;
 
-  // SM120 uses fallback implementation due to TMEM/TMA constraints
-  // SM120 (Blackwell workstation GPUs) does NOT have TMEM or TCGEN05/UMMA
-  // which are datacenter-only features (SM100). Use ATen fallback instead.
   int device = 0;
   cudaGetDevice(&device);
   cudaDeviceProp prop;
@@ -37,9 +38,91 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       prop.minor,
       ". Please install the SM100 build for server parts.");
 
-  // Use fallback for all SM120 configurations - the CUTLASS backward mainloop
-  // has TMA/TMEM dependencies that SM120 doesn't support
   const auto stream = c10::cuda::getCurrentCUDAStream();
+
+  // Check head dimensions for WMMA kernel compatibility
+  const int head_dim = q.size(-1);
+  const int num_heads = q.size(1);
+  const int batch_size = cumulative_seqlen_q.size(0) - 1;
+
+  // WMMA kernel supports both varlen and non-varlen modes
+  // Requirements: head_dim == 128, bf16, non-MLA
+  bool can_use_wmma = !IsMla &&
+                      head_dim == 128 &&
+                      max_seqlen_q > 0 &&
+                      total_seqlen_kv > 0 &&
+                      q.scalar_type() == at::ScalarType::BFloat16;
+
+  if (can_use_wmma) {
+    // Create float32 tensors for atomic accumulation
+    // K-major kernel: dQ needs atomics (float), dK/dV don't (accumulated in smem)
+    auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+    auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
+    auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
+
+    // Compute max_seqlen_kv for grid sizing
+    int max_seqlen_kv = 0;
+    if (IsVarlen) {
+      // For varlen, find max from cu_seqlens
+      auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
+      auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
+      for (int b = 0; b < batch_size; ++b) {
+        int seq_len = cu_kv_data[b + 1] - cu_kv_data[b];
+        if (seq_len > max_seqlen_kv) max_seqlen_kv = seq_len;
+      }
+    } else {
+      // For non-varlen, uniform sequence length
+      max_seqlen_kv = total_seqlen_kv / batch_size;
+    }
+
+    // DUAL KERNEL ARCHITECTURE for optimal performance:
+    // 1. Q-major dQ kernel: Grid over Q-blocks, NO ATOMICS for dQ
+    // 2. K-major dK/dV kernel: Grid over K-blocks, NO ATOMICS for dK/dV
+    // Both kernels use cp.async double-buffered pipelining
+    if (IsCausal) {
+      flash::detail::launch_fmha_bwd_sm120_dual<true>(
+          stream,
+          d_o,
+          q,
+          k,
+          v,
+          o,
+          lse,
+          cumulative_seqlen_q,
+          cumulative_seqlen_kv,
+          dq_float,
+          dk_float,
+          dv_float,
+          softmax_scale,
+          max_seqlen_q,
+          max_seqlen_kv);
+    } else {
+      flash::detail::launch_fmha_bwd_sm120_dual<false>(
+          stream,
+          d_o,
+          q,
+          k,
+          v,
+          o,
+          lse,
+          cumulative_seqlen_q,
+          cumulative_seqlen_kv,
+          dq_float,
+          dk_float,
+          dv_float,
+          softmax_scale,
+          max_seqlen_q,
+          max_seqlen_kv);
+    }
+
+    // Convert float outputs back to bf16
+    dq.copy_(dq_float.to(dq.scalar_type()));
+    dk.copy_(dk_float.to(dk.scalar_type()));
+    dv.copy_(dv_float.to(dv.scalar_type()));
+    return;
+  }
+
+  // Fall back to batched ATen implementation for MLA or other unsupported cases
   flash::detail::run_fmha_bwd_sm120_fallback<IsVarlen, IsMla, Mask>(
       stream,
       d_o,

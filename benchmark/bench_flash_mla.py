@@ -3,7 +3,7 @@ import argparse
 import math
 import random
 
-import flashinfer
+# import flashinfer  # Skip: JIT compiles for SM90 only, not SM120
 import os
 import torch
 import triton
@@ -546,8 +546,8 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
 available_targets = [
     "torch",
     "flash_mla",
-    "flash_infer",
-    "flash_mla_triton",
+    # "flash_infer",  # Skip: JIT compiles for SM90 only, not SM120
+    # "flash_mla_triton",  # Skip: Triton kernel syntax issue with Triton 3.x
 ]
 
 shape_configs = [
