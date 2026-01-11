@@ -12,6 +12,14 @@ Status:
 | Dense Prefill Bwd  | WORKING  | `fmha_cutlass_bwd_sm120.cu` |
 | Sparse Prefill     | WIP      | `"WIP"`                     |
 
+Sparse forward is working as expected with WMMA wraps. Training absolutely needs TMEM and > 110kb of smem
+The 99KB smem limit is blocking further tile size increases. The remaining performance gap is due to:
+
+WMMA 16x16 tiles vs SM100's 64x128 TCGEN05 tiles
+No TMEM - forced to use limited smem
+No TMA - using slower cp.async
+Two kernel passes - both recompute full attention scores
+
 ## NOT Implemented (Sparse)
 
 | Kernel         | Status        | Error                                           |
