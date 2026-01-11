@@ -698,6 +698,123 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// Warp-level max reduction using shuffle instructions
+// Reduces 32 values (one per lane) to the maximum across all lanes
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    const unsigned int FULL_MASK = 0xFFFFFFFF;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, offset));
+    }
+    return val;
+}
+
+// ============================================================================
+// BANK CONFLICT ELIMINATION VIA XOR SWIZZLING
+// ============================================================================
+// XOR-based swizzle pattern for eliminating shared memory bank conflicts.
+// Based on gau-nernst Flash Attention 5090 research achieving 94.39% SOL.
+//
+// Formula: swizzled_index = index ^ ((row_idx / divisor) << 4)
+// where divisor = max(64 / STRIDE, 1)
+//
+// For bf16 with D=128 (STRIDE=128 bytes per row = 64 bf16 elements):
+// - divisor = max(64/128, 1) = 1 (but we use 64 bf16 = 128 bytes)
+// - XOR bits 4-6 of address with bits 0-2 of row index
+//
+// Reference: https://gau-nernst.github.io/fa-5090/
+// ============================================================================
+
+// Swizzle index for bf16 tiles with ROW_STRIDE elements per row
+// For D=128 head dim, ROW_STRIDE = 128 (bf16 elements)
+template <int ROW_STRIDE>
+__device__ __forceinline__ int swizzle_bf16_index(int row, int col) {
+    // For 128-byte swizzle pattern:
+    // - 8 bf16 elements = 16 bytes (one bank)
+    // - XOR bits based on row index within each 8-row group
+    constexpr int ELEMENTS_PER_BANK = 8;  // 8 bf16 = 16 bytes
+
+    // Get row index within 8-row swizzle group
+    int row_in_group = row & 0x7;  // row % 8
+
+    // Calculate which 16-byte bank the column falls into
+    int bank = col / ELEMENTS_PER_BANK;
+    int offset_in_bank = col & (ELEMENTS_PER_BANK - 1);  // col % 8
+
+    // XOR the bank with row_in_group to eliminate conflicts
+    int swizzled_bank = bank ^ row_in_group;
+
+    // Reconstruct the swizzled column index
+    int swizzled_col = swizzled_bank * ELEMENTS_PER_BANK + offset_in_bank;
+
+    return row * ROW_STRIDE + swizzled_col;
+}
+
+// Swizzle index for float tiles (scores, accumulators)
+// For M=32, N=32 tiles, ROW_STRIDE = 32 floats = 128 bytes per row
+template <int ROW_STRIDE>
+__device__ __forceinline__ int swizzle_float_index(int row, int col) {
+    // For float (4 bytes), 4 elements = 16 bytes (one bank)
+    constexpr int ELEMENTS_PER_BANK = 4;
+
+    int row_in_group = row & 0x7;
+    int bank = col / ELEMENTS_PER_BANK;
+    int offset_in_bank = col & (ELEMENTS_PER_BANK - 1);
+
+    int swizzled_bank = bank ^ row_in_group;
+    int swizzled_col = swizzled_bank * ELEMENTS_PER_BANK + offset_in_bank;
+
+    return row * ROW_STRIDE + swizzled_col;
+}
+
+// Inverse swizzle to read back in original order
+template <int ROW_STRIDE>
+__device__ __forceinline__ int unswizzle_bf16_index(int row, int col) {
+    // XOR is its own inverse, so same operation
+    return swizzle_bf16_index<ROW_STRIDE>(row, col);
+}
+
+template <int ROW_STRIDE>
+__device__ __forceinline__ int unswizzle_float_index(int row, int col) {
+    return swizzle_float_index<ROW_STRIDE>(row, col);
+}
+
+// ============================================================================
+// SWIZZLED MEMORY ACCESS HELPERS
+// ============================================================================
+
+// Store bf16 value to swizzled location
+template <int ROW_STRIDE>
+__device__ __forceinline__ void store_bf16_swizzled(
+    __nv_bfloat16* base, int row, int col, __nv_bfloat16 val
+) {
+    base[swizzle_bf16_index<ROW_STRIDE>(row, col)] = val;
+}
+
+// Load bf16 value from swizzled location
+template <int ROW_STRIDE>
+__device__ __forceinline__ __nv_bfloat16 load_bf16_swizzled(
+    const __nv_bfloat16* base, int row, int col
+) {
+    return base[swizzle_bf16_index<ROW_STRIDE>(row, col)];
+}
+
+// Store float value to swizzled location
+template <int ROW_STRIDE>
+__device__ __forceinline__ void store_float_swizzled(
+    float* base, int row, int col, float val
+) {
+    base[swizzle_float_index<ROW_STRIDE>(row, col)] = val;
+}
+
+// Load float value from swizzled location
+template <int ROW_STRIDE>
+__device__ __forceinline__ float load_float_swizzled(
+    const float* base, int row, int col
+) {
+    return base[swizzle_float_index<ROW_STRIDE>(row, col)];
+}
+
 // Vectorized dot product for bf16x2 vectors - reduces 2 elements at once
 // Uses explicit low/high extraction for better compatibility
 __device__ __forceinline__ float dot_bf16x2(const __nv_bfloat162& a, const __nv_bfloat162& b) {
@@ -1243,6 +1360,8 @@ __device__ void compute_qk_scores_wmma_buf(
     __syncthreads();
 
     const int tid = threadIdx.x;
+    // Unroll for ILP: 32x32=1024 elements, 256 threads, ~4 iterations per thread
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -1275,6 +1394,8 @@ __device__ void recompute_softmax(
 ) {
     const int tid = threadIdx.x;
 
+    // Unroll for ILP: 32x32=1024 elements, 256 threads, ~4 iterations per thread
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -1353,6 +1474,8 @@ __device__ void compute_dscores(
 ) {
     const int tid = threadIdx.x;
 
+    // Unroll for ILP: 32x32=1024 elements, 256 threads, ~4 iterations per thread
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -1573,7 +1696,8 @@ __device__ void compute_dk_wmma_varlen(
             }
             __syncwarp();
         }
-        __syncthreads();  // Sync between N tiles to ensure cache coherency
+        // REMOVED: __syncthreads() - redundant after atomic writes to global memory
+        // Each warp uses its own staging buffer, no cross-warp smem dependency
     }
 }
 
@@ -1659,7 +1783,7 @@ __device__ void compute_dv_wmma_varlen(
             }
             __syncwarp();
         }
-        __syncthreads();  // Sync between N tiles to ensure cache coherency
+        // REMOVED: __syncthreads() - redundant after atomic writes to global memory
     }
 }
 
@@ -1766,15 +1890,17 @@ __device__ __forceinline__ void zero_init_smem(BwdSmemAccessor& smem) {
     const __nv_bfloat162 zero_bf16x2 = __floats2bfloat162_rn(0.0f, 0.0f);
     const float4 zero_f4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    // Zero Q tile
+    // Zero Q tile (32*128/2 = 2048 elements, 256 threads, 8 iters)
     __nv_bfloat162* q_ptr2 = reinterpret_cast<__nv_bfloat162*>(smem.q_tile());
+    #pragma unroll 8
     for (int i = tid; i < (BWD_BLOCK_M * BWD_BLOCK_D) / 2; i += BWD_NUM_THREADS) {
         q_ptr2[i] = zero_bf16x2;
     }
 
-    // Zero both K tile buffers
+    // Zero both K tile buffers (32*128/2 = 2048 elements, 8 iters)
     __nv_bfloat162* k_ptr2_0 = reinterpret_cast<__nv_bfloat162*>(smem.k_tile_buf(0));
     __nv_bfloat162* k_ptr2_1 = reinterpret_cast<__nv_bfloat162*>(smem.k_tile_buf(1));
+    #pragma unroll 8
     for (int i = tid; i < (BWD_BLOCK_N * BWD_BLOCK_D) / 2; i += BWD_NUM_THREADS) {
         k_ptr2_0[i] = zero_bf16x2;
         k_ptr2_1[i] = zero_bf16x2;
@@ -1783,6 +1909,7 @@ __device__ __forceinline__ void zero_init_smem(BwdSmemAccessor& smem) {
     // Zero both V tile buffers
     __nv_bfloat162* v_ptr2_0 = reinterpret_cast<__nv_bfloat162*>(smem.v_tile_buf(0));
     __nv_bfloat162* v_ptr2_1 = reinterpret_cast<__nv_bfloat162*>(smem.v_tile_buf(1));
+    #pragma unroll 8
     for (int i = tid; i < (BWD_BLOCK_N * BWD_BLOCK_D) / 2; i += BWD_NUM_THREADS) {
         v_ptr2_0[i] = zero_bf16x2;
         v_ptr2_1[i] = zero_bf16x2;
@@ -1790,21 +1917,23 @@ __device__ __forceinline__ void zero_init_smem(BwdSmemAccessor& smem) {
 
     // Zero dO tile
     __nv_bfloat162* do_ptr2 = reinterpret_cast<__nv_bfloat162*>(smem.do_tile());
+    #pragma unroll 8
     for (int i = tid; i < (BWD_BLOCK_M * BWD_BLOCK_D) / 2; i += BWD_NUM_THREADS) {
         do_ptr2[i] = zero_bf16x2;
     }
 
-    // Zero scores/probs/dscores
+    // Zero scores/probs/dscores (32*32/4 = 256 elements, 1 iter)
     float4* scores_ptr4 = reinterpret_cast<float4*>(smem.scores());
     float4* probs_ptr4 = reinterpret_cast<float4*>(smem.probs());
     float4* dscores_ptr4 = reinterpret_cast<float4*>(smem.dscores());
+    #pragma unroll 1
     for (int i = tid; i < (BWD_BLOCK_M * BWD_BLOCK_N) / 4; i += BWD_NUM_THREADS) {
         scores_ptr4[i] = zero_f4;
         probs_ptr4[i] = zero_f4;
         dscores_ptr4[i] = zero_f4;
     }
 
-    // Zero LSE and delta
+    // Zero LSE and delta (32 elements, 1 iter for most threads)
     float* lse_ptr = smem.lse();
     float* delta_ptr = smem.delta();
     for (int i = tid; i < BWD_BLOCK_M; i += BWD_NUM_THREADS) {
@@ -1814,12 +1943,14 @@ __device__ __forceinline__ void zero_init_smem(BwdSmemAccessor& smem) {
 
     // Zero O tile
     __nv_bfloat162* o_ptr2 = reinterpret_cast<__nv_bfloat162*>(smem.o_tile());
+    #pragma unroll 8
     for (int i = tid; i < (BWD_BLOCK_M * BWD_BLOCK_D) / 2; i += BWD_NUM_THREADS) {
         o_ptr2[i] = zero_bf16x2;
     }
 
-    // Zero dQ accumulator
+    // Zero dQ accumulator (32*128/4 = 1024 elements, 4 iters)
     float4* dq_ptr4 = reinterpret_cast<float4*>(smem.dq_acc());
+    #pragma unroll 4
     for (int i = tid; i < (BWD_BLOCK_M * BWD_BLOCK_D) / 4; i += BWD_NUM_THREADS) {
         dq_ptr4[i] = zero_f4;
     }
