@@ -1503,19 +1503,15 @@ __device__ void compute_dq_wmma_buf(
     const int warp_id = threadIdx.x / 32;
     const int tid = threadIdx.x;
 
+    // OPTIMIZED: Merged zero+convert pass (removes one __syncthreads)
     __nv_bfloat16* dscores_bf16 = smem.temp_bf16();
-
-    for (int idx = tid; idx < BWD_BLOCK_M * BWD_BLOCK_N; idx += BWD_NUM_THREADS) {
-        dscores_bf16[idx] = __float2bfloat16(0.0f);
-    }
-    __syncthreads();
-
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
-        int m = idx / n_size;
-        int n = idx % n_size;
-        if (m < m_size && n < n_size) {
-            dscores_bf16[m * BWD_BLOCK_N + n] = __float2bfloat16(smem.dscores()[m * BWD_BLOCK_N + n]);
-        }
+    constexpr int BUF_TOTAL = BWD_BLOCK_M * BWD_BLOCK_N;
+    #pragma unroll 4
+    for (int idx = tid; idx < BUF_TOTAL; idx += BWD_NUM_THREADS) {
+        int m = idx / BWD_BLOCK_N;  // Use fixed stride for index calculation
+        int n = idx % BWD_BLOCK_N;
+        float val = (m < m_size && n < n_size) ? smem.dscores()[idx] : 0.0f;
+        dscores_bf16[idx] = __float2bfloat16(val);
     }
     __syncthreads();
 
@@ -1639,6 +1635,7 @@ __device__ void compute_dk_wmma_varlen(
     // Step 1: Transpose dScores [M, N] -> temp_bf16 as [N, M] in bf16
     __nv_bfloat16* dscores_t = smem.temp_bf16();
 
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -1660,6 +1657,7 @@ __device__ void compute_dk_wmma_varlen(
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
             fill_fragment(acc, 0.0f);
 
+            #pragma unroll 2
             for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -1730,6 +1728,7 @@ __device__ void compute_dv_wmma_varlen(
     // Step 1: Transpose P [M, N] -> temp_bf16 as [N, M] in bf16
     __nv_bfloat16* p_t = smem.temp_bf16();
 
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -1748,6 +1747,7 @@ __device__ void compute_dv_wmma_varlen(
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
             fill_fragment(acc, 0.0f);
 
+            #pragma unroll 2
             for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -2162,6 +2162,7 @@ __device__ void accumulate_dk_to_smem(
     // Transpose dScores [M, N] -> temp_bf16 as [N, M] in bf16
     __nv_bfloat16* dscores_t = smem.temp_bf16();
 
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -2181,6 +2182,7 @@ __device__ void accumulate_dk_to_smem(
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
         fill_fragment(acc, 0.0f);
 
+        #pragma unroll 2
         for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -2231,6 +2233,7 @@ __device__ void accumulate_dv_to_smem(
     // Transpose P [M, N] -> temp_bf16 as [N, M] in bf16
     __nv_bfloat16* p_t = smem.temp_bf16();
 
+    #pragma unroll 4
     for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
         int m = idx / n_size;
         int n = idx % n_size;
@@ -2250,6 +2253,7 @@ __device__ void accumulate_dv_to_smem(
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
         fill_fragment(acc, 0.0f);
 
+        #pragma unroll 2
         for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -2265,6 +2269,7 @@ __device__ void accumulate_dv_to_smem(
         store_matrix_sync(staging, acc, WMMA_N, mem_row_major);
         __syncwarp();
 
+        #pragma unroll 8
         for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
             int local_n = i / WMMA_N;
             int local_d = i % WMMA_N;
@@ -2341,7 +2346,13 @@ __device__ void write_dk_dv_from_smem(
     const int n_size = n_end - n_start;
     const int stride_token = num_heads * head_dim;
 
-    // Write dk_acc to global dk (with scale for dK)
+    // Write dk_acc / dv_acc to global memory.
+    // NOTE: the softmax scale is already folded into dScores
+    // (dScores = (dP - delta) * P * scale), so dk_acc = dScores^T @ Q already equals
+    // the true dK. Multiplying by `scale` again here double-scales dK and yields the
+    // exact (1 - scale) relative gradient error. dQ is written WITHOUT an extra scale
+    // for the same reason, so dK must match it. (scale param retained for ABI/callers.)
+    (void)scale;
     for (int idx = tid; idx < n_size * head_dim; idx += BWD_NUM_THREADS) {
         int n = idx / head_dim;
         int d = idx % head_dim;
@@ -2349,8 +2360,7 @@ __device__ void write_dk_dv_from_smem(
         int global_token = kv_seq_start + n_start + n;
         int global_idx = global_token * stride_token + head_idx * head_dim + d;
 
-        // dK needs scale factor applied
-        dk[global_idx] = smem.dk_acc()[n * BWD_BLOCK_D + d] * scale;
+        dk[global_idx] = smem.dk_acc()[n * BWD_BLOCK_D + d];
         dv[global_idx] = smem.dv_acc()[n * BWD_BLOCK_D + d];
     }
 }
@@ -2659,20 +2669,24 @@ __device__ void kmajor_recompute_softmax(
     constexpr int N_SHIFT = 4;  // log2(16)
     constexpr int N_MASK = KMAJOR_BLOCK_N - 1;
 
+    // Iterate the FULL [BWD_BLOCK_M x KMAJOR_BLOCK_N] tile (stride-KMAJOR_BLOCK_N index
+    // decode) and ZERO invalid positions. Bounding by m_size*n_size under-iterates the M
+    // rows whenever n_size < KMAJOR_BLOCK_N (a partial last KV block, i.e.
+    // seqlen_kv % KMAJOR_BLOCK_N != 0), leaving STALE probs that the dK/dV transpose+WMMA
+    // later consume -> garbage gradients. For full tiles this is identical to the old bound.
     #pragma unroll 4
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
+    for (int idx = tid; idx < BWD_BLOCK_M * KMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
         int m = idx >> N_SHIFT;
         int n = idx & N_MASK;
 
+        float prob = 0.0f;
         if (m < m_size && n < n_size) {
             float score = smem.scores()[idx];  // Already in row-major with KMAJOR_BLOCK_N stride
             float lse_m = smem.lse()[m];
-
             bool masked = is_causal && ((m_start_global + m) < (n_start_global + n));
-
-            float prob = masked ? 0.0f : expf(score - lse_m);
-            smem.probs()[idx] = prob;
+            prob = masked ? 0.0f : expf(score - lse_m);
         }
+        smem.probs()[idx] = prob;
     }
     __syncthreads();
 }
@@ -2729,17 +2743,22 @@ __device__ void kmajor_compute_dscores(
     constexpr int N_SHIFT = 4;  // log2(16)
     constexpr int N_MASK = KMAJOR_BLOCK_N - 1;
 
+    // Full-tile iteration + zero invalid (see kmajor_recompute_softmax): bounding by
+    // m_size*n_size under-iterates for a partial KV block and leaves stale dScores that
+    // the dK transpose/WMMA consume. Identical to the old bound for full tiles.
     #pragma unroll 4
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
+    for (int idx = tid; idx < BWD_BLOCK_M * KMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
         int m = idx >> N_SHIFT;
         int n = idx & N_MASK;
 
+        float ds = 0.0f;
         if (m < m_size && n < n_size) {
             float dp = smem.dscores()[idx];
             float p = smem.probs()[idx];
             float delta_m = smem.delta()[m];
-            smem.dscores()[idx] = (dp - delta_m) * p * scale;
+            ds = (dp - delta_m) * p * scale;
         }
+        smem.dscores()[idx] = ds;
     }
     __syncthreads();
 }
@@ -2762,20 +2781,15 @@ __device__ void kmajor_compute_dq_wmma(
 
     __nv_bfloat16* dscores_bf16 = smem.temp_bf16();
 
-    // Convert dscores to bf16 - use power-of-2 math
+    // OPTIMIZED: Merged zero+convert pass (removes one __syncthreads)
+    // Convert dscores to bf16. dScores is already zeroed at invalid positions by
+    // kmajor_compute_dscores (full-tile + zero-invalid), so copy the whole buffer.
+    // The previous `idx < m_size*n_size` flat-count test wrongly zeroed valid rows when
+    // the last KV block was partial (seqlen_kv % KMAJOR_BLOCK_N != 0).
+    constexpr int TOTAL_ELEMENTS = BWD_BLOCK_M * KMAJOR_BLOCK_N;
     #pragma unroll 4
-    for (int idx = tid; idx < BWD_BLOCK_M * KMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
-        dscores_bf16[idx] = __float2bfloat16(0.0f);
-    }
-    __syncthreads();
-
-    #pragma unroll 4
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
-        int m = idx >> N_SHIFT;
-        int n = idx & N_MASK;
-        if (m < m_size && n < n_size) {
-            dscores_bf16[idx] = __float2bfloat16(smem.dscores()[idx]);
-        }
+    for (int idx = tid; idx < TOTAL_ELEMENTS; idx += BWD_NUM_THREADS) {
+        dscores_bf16[idx] = __float2bfloat16(smem.dscores()[idx]);
     }
     __syncthreads();
 
@@ -2836,28 +2850,26 @@ __device__ void kmajor_accumulate_dk_to_smem(
     const int lane_id = threadIdx.x % 32;
     const int tid = threadIdx.x;
 
-    // Transpose dScores [M, N] -> temp_bf16 as [N, M]
-    // OPTIMIZED: No pre-zeroing, direct transpose with fast index math
+    // OPTIMIZED: Transpose dScores [M, N] -> temp_bf16 as [N, M]
+    // Merged transpose+zero in single pass using fast index math
     __nv_bfloat16* dscores_t = smem.temp_bf16();
 
     // Fast transpose: use bit operations for power-of-2 N=16
-    // idx = m * N + n, so m = idx >> 4, n = idx & 15
     constexpr int N_SHIFT = 4;  // log2(KMAJOR_BLOCK_N=16)
     constexpr int N_MASK = KMAJOR_BLOCK_N - 1;
+    constexpr int KMAJOR_TOTAL = BWD_BLOCK_M * KMAJOR_BLOCK_N;
+    const int valid_elements = m_size * n_size;
 
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
-        int m = idx >> N_SHIFT;
-        int n = idx & N_MASK;
-        // Store transposed: dscores_t[n][m] = dscores[m][n]
-        dscores_t[n * BWD_BLOCK_M + m] = __float2bfloat16(smem.dscores()[idx]);
-    }
-    // Zero remaining entries only if m_size < BWD_BLOCK_M
-    if (m_size < BWD_BLOCK_M) {
-        for (int idx = tid + m_size * n_size; idx < BWD_BLOCK_M * KMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
-            int m = idx >> N_SHIFT;
-            int n = idx & N_MASK;
-            dscores_t[n * BWD_BLOCK_M + m] = __float2bfloat16(0.0f);
-        }
+    // Single-pass transpose with zero for out-of-bounds
+    #pragma unroll 4
+    for (int dst_idx = tid; dst_idx < KMAJOR_TOTAL; dst_idx += BWD_NUM_THREADS) {
+        // dst_idx is index into transposed buffer [N, M] with stride BWD_BLOCK_M
+        int n = dst_idx / BWD_BLOCK_M;  // N dimension (0..N-1)
+        int m = dst_idx % BWD_BLOCK_M;  // M dimension (0..M-1)
+        int src_idx = m * KMAJOR_BLOCK_N + n;  // Source index in [M, N] layout
+
+        float val = (m < m_size && n < n_size) ? smem.dscores()[src_idx] : 0.0f;
+        dscores_t[dst_idx] = __float2bfloat16(val);
     }
     __syncthreads();
 
@@ -2873,6 +2885,7 @@ __device__ void kmajor_accumulate_dk_to_smem(
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
         fill_fragment(acc, 0.0f);
 
+        #pragma unroll 2
         for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -2920,26 +2933,23 @@ __device__ void kmajor_accumulate_dv_to_smem(
     const int lane_id = threadIdx.x % 32;
     const int tid = threadIdx.x;
 
-    // Transpose P [M, N] -> temp_bf16 as [N, M]
-    // OPTIMIZED: No pre-zeroing, direct transpose with fast index math
+    // OPTIMIZED: Transpose P [M, N] -> temp_bf16 as [N, M]
+    // Merged transpose+zero in single pass using fast index math
     __nv_bfloat16* p_t = smem.temp_bf16();
 
-    // Fast transpose: use bit operations for power-of-2 N=16
-    constexpr int N_SHIFT = 4;  // log2(KMAJOR_BLOCK_N=16)
-    constexpr int N_MASK = KMAJOR_BLOCK_N - 1;
+    // Fast transpose with power-of-2 optimization
+    constexpr int KMAJOR_P_TOTAL = BWD_BLOCK_M * KMAJOR_BLOCK_N;
 
-    for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
-        int m = idx >> N_SHIFT;
-        int n = idx & N_MASK;
-        p_t[n * BWD_BLOCK_M + m] = __float2bfloat16(smem.probs()[idx]);
-    }
-    // Zero remaining entries only if m_size < BWD_BLOCK_M
-    if (m_size < BWD_BLOCK_M) {
-        for (int idx = tid + m_size * n_size; idx < BWD_BLOCK_M * KMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
-            int m = idx >> N_SHIFT;
-            int n = idx & N_MASK;
-            p_t[n * BWD_BLOCK_M + m] = __float2bfloat16(0.0f);
-        }
+    // Single-pass transpose with zero for out-of-bounds
+    #pragma unroll 4
+    for (int dst_idx = tid; dst_idx < KMAJOR_P_TOTAL; dst_idx += BWD_NUM_THREADS) {
+        // dst_idx is index into transposed buffer [N, M] with stride BWD_BLOCK_M
+        int n = dst_idx / BWD_BLOCK_M;  // N dimension (0..N-1)
+        int m = dst_idx % BWD_BLOCK_M;  // M dimension (0..M-1)
+        int src_idx = m * KMAJOR_BLOCK_N + n;  // Source index in [M, N] layout
+
+        float val = (m < m_size && n < n_size) ? smem.probs()[src_idx] : 0.0f;
+        p_t[dst_idx] = __float2bfloat16(val);
     }
     __syncthreads();
 
@@ -2955,6 +2965,7 @@ __device__ void kmajor_accumulate_dv_to_smem(
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
         fill_fragment(acc, 0.0f);
 
+        #pragma unroll 2
         for (int k_tile = 0; k_tile < m_tiles; ++k_tile) {
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> b_frag;
@@ -3005,6 +3016,9 @@ __device__ void kmajor_write_dk_dv_from_smem(
     const int n_size = n_end - n_start;
     const int stride_token = num_heads * head_dim;
 
+    // scale is already folded into dScores, so dk_acc == true dK (no extra scale here;
+    // an extra * scale double-scales dK -> exact (1 - scale) gradient error).
+    (void)scale;
     for (int idx = tid; idx < n_size * head_dim; idx += BWD_NUM_THREADS) {
         int n = idx / head_dim;
         int d = idx % head_dim;
@@ -3012,7 +3026,7 @@ __device__ void kmajor_write_dk_dv_from_smem(
         int global_token = kv_seq_start + n_start + n;
         int global_idx = global_token * stride_token + head_idx * head_dim + d;
 
-        dk[global_idx] = smem.dk_acc()[n * BWD_BLOCK_D + d] * scale;
+        dk[global_idx] = smem.dk_acc()[n * BWD_BLOCK_D + d];
         dv[global_idx] = smem.dv_acc()[n * BWD_BLOCK_D + d];
     }
 }
@@ -3500,17 +3514,21 @@ fmha_bwd_sm120_dq_kernel(
         // Recompute softmax P
         constexpr int N_SHIFT = 5;  // log2(QMAJOR_BLOCK_N=32)
         constexpr int N_MASK = QMAJOR_BLOCK_N - 1;
+        // Full-tile iteration + zero invalid: m_size*n_size under-iterates for a partial
+        // KV block (seqlen_kv % QMAJOR_BLOCK_N != 0), leaving stale probs that the dQ WMMA
+        // consumes -> garbage dQ. Identical to the old bound for full tiles.
         #pragma unroll 4
-        for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
+        for (int idx = tid; idx < QMAJOR_BLOCK_M * QMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
             int m = idx >> N_SHIFT;
             int n = idx & N_MASK;
+            float prob = 0.0f;
             if (m < m_size && n < n_size) {
                 float score = smem.scores()[idx];
                 float lse_m = smem.lse()[m];
                 bool masked = kIsCausal && ((m_start + m) < (n_start + n));
-                float prob = masked ? 0.0f : expf(score - lse_m);
-                smem.probs()[idx] = prob;
+                prob = masked ? 0.0f : expf(score - lse_m);
             }
+            smem.probs()[idx] = prob;
         }
         __syncthreads();
 
@@ -3539,28 +3557,32 @@ fmha_bwd_sm120_dq_kernel(
         __syncthreads();
 
         // Compute dScores = (dP - delta) * P * scale
+        // Full-tile iteration + zero invalid (see the softmax loop above).
         #pragma unroll 4
-        for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
+        for (int idx = tid; idx < QMAJOR_BLOCK_M * QMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
             int m = idx >> N_SHIFT;
             int n = idx & N_MASK;
+            float ds = 0.0f;
             if (m < m_size && n < n_size) {
                 float dp = smem.dscores()[idx];
                 float p = smem.probs()[idx];
                 float delta_m = smem.delta()[m];
-                smem.dscores()[idx] = (dp - delta_m) * p * scale;
+                ds = (dp - delta_m) * p * scale;
             }
+            smem.dscores()[idx] = ds;
         }
         __syncthreads();
 
         // Convert dscores to bf16
+        // OPTIMIZED: Merged zero+convert pass (removes one __syncthreads)
+        // Convert dscores to bf16. dScores is already zeroed at invalid positions by the
+        // dScores loop above (full-tile + zero-invalid), so copy the whole buffer. The old
+        // `idx < m_size*n_size` flat-count test wrongly zeroed valid rows for a partial KV
+        // block (seqlen_kv % QMAJOR_BLOCK_N != 0) -> wrong dQ on non-causal.
         __nv_bfloat16* dscores_bf16 = smem.temp_bf16();
+        constexpr int QMAJOR_TOTAL = QMAJOR_BLOCK_M * QMAJOR_BLOCK_N;
         #pragma unroll 4
-        for (int idx = tid; idx < QMAJOR_BLOCK_M * QMAJOR_BLOCK_N; idx += BWD_NUM_THREADS) {
-            dscores_bf16[idx] = __float2bfloat16(0.0f);
-        }
-        __syncthreads();
-        #pragma unroll 4
-        for (int idx = tid; idx < m_size * n_size; idx += BWD_NUM_THREADS) {
+        for (int idx = tid; idx < QMAJOR_TOTAL; idx += BWD_NUM_THREADS) {
             dscores_bf16[idx] = __float2bfloat16(smem.dscores()[idx]);
         }
         __syncthreads();

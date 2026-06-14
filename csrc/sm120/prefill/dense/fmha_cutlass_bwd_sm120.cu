@@ -10,6 +10,10 @@
 #include "sm120/prefill/dense/sm120_kernel_traits.hpp"
 #include "sm120/prefill/dense/fmha_cutlass_bwd_sm120.cuh"
 #include "sm120/prefill/dense/fmha_bwd_kernel_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_mla_kernel_sm120.cuh"
+
+#include <cstdlib>
+#include <algorithm>
 
 template<class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -120,6 +124,40 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
     dk.copy_(dk_float.to(dk.scalar_type()));
     dv.copy_(dv_float.to(dv.scalar_type()));
     return;
+  }
+
+  // Fused 192/128 MLA WMMA backward. DEFAULT ON for the MLA head dims (this repo's
+  // 192/128 model is the primary workload); OPT-OUT with FLASH_MLA_SM120_FUSED_MLA_BWD=0
+  // to fall back to the ATen path for ablation/debugging. Only valid for the MLA head
+  // dims (head_dim_qk=192, head_dim_vo=128); produces fp32 dQ/dK/dV (dQ via atomics
+  // across KV-blocks) then casts back to the caller dtype, mirroring the 128 WMMA path.
+  if constexpr (IsMla) {
+    static const bool kUseFusedMlaBwd = []() {
+      const char* e = std::getenv("FLASH_MLA_SM120_FUSED_MLA_BWD");
+      return (e == nullptr) || (e[0] != '0');  // unset/anything-but-0 => ON; "0" => OFF
+    }();
+    if (kUseFusedMlaBwd && head_dim == 192 && v.size(-1) == 128 &&
+        q.scalar_type() == at::ScalarType::BFloat16) {
+      int max_seqlen_kv = 0;
+      if (IsVarlen) {
+        auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
+        auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
+        for (int b = 0; b < batch_size; ++b)
+          max_seqlen_kv = std::max(max_seqlen_kv, cu_kv_data[b + 1] - cu_kv_data[b]);
+      } else {
+        max_seqlen_kv = total_seqlen_kv / batch_size;
+      }
+      auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+      auto dk_float = at::empty_like(dk, dk.options().dtype(at::kFloat));
+      auto dv_float = at::empty_like(dv, dv.options().dtype(at::kFloat));
+      flash::detail::launch_fmha_bwd_sm120_mla<IsCausal>(
+          stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+          dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+      dq.copy_(dq_float.to(dq.scalar_type()));
+      dk.copy_(dk_float.to(dk.scalar_type()));
+      dv.copy_(dv_float.to(dv.scalar_type()));
+      return;
+    }
   }
 
   // Fall back to batched ATen implementation for MLA or other unsupported cases

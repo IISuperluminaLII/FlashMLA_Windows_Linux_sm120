@@ -219,9 +219,24 @@ void run_fmha_bwd_sm120_fallback(const c10::cuda::CUDAStream& stream,
                                  float scale_softmax,
                                  int max_seqlen_q,
                                  int max_seqlen_kv) {
+  // Causal detection MUST use is_base_of, NOT is_same. The BACKWARD dispatcher
+  // (fmha_cutlass_bwd_sm120.cu) passes Mask = CausalForBackwardMask<kIsQBegin>,
+  // which DERIVES FROM CausalMask<kIsQBegin> (see collective/fmha_fusion.hpp) -- it
+  // is a distinct type. std::is_same_v<CausalMask<...>, CausalForBackwardMask<...>>
+  // is FALSE, so the previous check left kIsCausal == false for every causal
+  // backward call. The causal mask was then silently skipped and this fallback
+  // returned the gradients of FULL (non-causal) attention -- correct forward output
+  // but corrupted dq/dk/dv (a silent training-correctness bug on the 192/128 MLA
+  // path, which always routes here). The forward fallback is unaffected because the
+  // forward dispatcher passes the plain CausalMask<false>, which is_same matched.
+  // is_base_of_v matches the CausalMask<b> base for BOTH the plain forward mask and
+  // the derived backward mask; ResidualMaskForBackward / NoMask (non-causal) derive
+  // from NoMask only and correctly remain false. The causal convention applied below
+  // (col > row, top-left / Q-at-beginning) matches the forward fallback's own mask,
+  // so this is the exact gradient of the forward this fallback is paired with.
   constexpr bool kIsCausal =
-      std::is_same_v<Mask, cutlass::fmha::collective::CausalMask<false>> ||
-      std::is_same_v<Mask, cutlass::fmha::collective::CausalMask<true>>;
+      std::is_base_of_v<cutlass::fmha::collective::CausalMask<false>, Mask> ||
+      std::is_base_of_v<cutlass::fmha::collective::CausalMask<true>, Mask>;
 
   c10::cuda::OptionalCUDAGuard device_guard(q.device());
   c10::cuda::CUDAStreamGuard stream_guard(stream);
@@ -306,9 +321,13 @@ void run_fmha_bwd_sm120_fallback(const c10::cuda::CUDAStream& stream,
       scores.masked_fill_(causal_mask.unsqueeze(0), -std::numeric_limits<float>::infinity());
     }
 
-    // Compute softmax probs using saved LSE: [bh, seqlen_q, seqlen_kv]
-    at::Tensor log_probs = scores - lse_bh.unsqueeze(2);
-    at::Tensor probs = log_probs.exp();
+    // Recompute P directly as softmax of the (causally-masked) scores. This matches the
+    // forward's P exactly and is self-consistent. Using the forward's saved LSE here was
+    // WRONG for the causal path: the saved LSE does not correspond to the causal
+    // logsumexp, so probs = exp(scores - lse) was mis-normalized -> correct output but
+    // corrupted gradients (dq/dk/dv). Non-causal is unaffected (softmax == exp(s-lse)).
+    (void)lse_bh;
+    at::Tensor probs = at::softmax(scores, /*dim=*/-1);
 
     // dV = P^T @ dO: [bh, seqlen_kv, head_dim_v]
     at::Tensor dV_bh = at::bmm(probs.transpose(1, 2), d_o_bh);
@@ -443,8 +462,10 @@ void run_fmha_bwd_sm120_fallback(const c10::cuda::CUDAStream& stream,
       scores.masked_fill_(causal_mask.unsqueeze(0), -std::numeric_limits<float>::infinity());
     }
 
-    at::Tensor log_probs = scores - lse_ht.unsqueeze(2);
-    at::Tensor probs = log_probs.exp();
+    // Recompute P directly as softmax of the masked scores (self-consistent; the saved
+    // LSE is not the causal logsumexp -> see the non-varlen path above).
+    (void)lse_ht;
+    at::Tensor probs = at::softmax(scores, /*dim=*/-1);
 
     at::Tensor dV_ht = at::bmm(probs.transpose(1, 2), d_o_ht);
     at::Tensor dP = at::bmm(d_o_ht, v_ht.transpose(1, 2));

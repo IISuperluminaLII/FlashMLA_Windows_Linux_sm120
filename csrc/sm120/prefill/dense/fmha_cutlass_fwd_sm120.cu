@@ -9,6 +9,9 @@
 
 #include "sm120/prefill/dense/sm120_kernel_traits.hpp"
 #include "sm120/prefill/dense/fmha_cutlass_fwd_sm120.cuh"
+#include "sm120/prefill/dense/fmha_fwd_mla_kernel_sm120.cuh"
+
+#include <cstdlib>
 
 template <class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -76,6 +79,31 @@ void FMHACutlassSM120FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
       scalar_type_out == at::ScalarType::BFloat16) {
     using Element = cutlass::bfloat16_t;
     using ElementOut = cutlass::bfloat16_t;
+
+    // Fused WMMA forward (DEFAULT ON; opt-OUT with FLASH_MLA_SM120_FUSED_FWD=0). Replaces
+    // the ATen fp32 forward fallback for the DENSE path -- ports the sparse-prefill WMMA
+    // approach to dense full attention (FlashAttention-2 online softmax). Covers 192/128
+    // (MLA) and 128/128, MHA only; emits O (bf16) + LSE (fp32, head-major .T view).
+    {
+      static const bool kUseFusedFwd = []() {
+        const char* e = std::getenv("FLASH_MLA_SM120_FUSED_FWD");
+        return (e == nullptr) || (e[0] != '0');
+      }();
+      const bool causal = (mask_mode == MaskMode::kCausal);
+      const bool mha = (q.size(1) == k.size(1));
+      const bool dims_ok = (head_dim_vo == 128) && (head_dim_qk == 192 || head_dim_qk == 128);
+      if (kUseFusedFwd && dims_ok && mha) {
+        const auto stream = c10::cuda::getCurrentCUDAStream();
+        if (head_dim_qk == 192) {
+          if (causal) flash::detail::launch_fmha_fwd_sm120_mla<192, 128, true>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+          else        flash::detail::launch_fmha_fwd_sm120_mla<192, 128, false>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+        } else {
+          if (causal) flash::detail::launch_fmha_fwd_sm120_mla<128, 128, true>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+          else        flash::detail::launch_fmha_fwd_sm120_mla<128, 128, false>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+        }
+        return;
+      }
+    }
 
     auto apply_config = [&](auto fn) {
       if (mask_mode == MaskMode::kCausal) {
