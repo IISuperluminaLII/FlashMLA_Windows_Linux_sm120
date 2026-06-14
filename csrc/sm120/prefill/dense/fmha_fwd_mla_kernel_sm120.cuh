@@ -43,15 +43,31 @@ constexpr int FWD_NUM_THREADS = FWD_NUM_WARPS * 32;   // 256
 constexpr int FWD_BM = 32;
 constexpr int FWD_BN = 32;
 
+// --- cp.async helpers (local, __forceinline__ => no external linkage; unique names so
+//     this header stays independent of fmha_bwd_kernel_sm120.cuh). sm_120 has NO TMA,
+//     so cp.async (LDGSTS) is the correct async-copy path. ---
+__device__ __forceinline__ void fwd_cp_async_cg16(void* smem_ptr, const void* gmem_ptr) {
+    unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_ptr));
+}
+__device__ __forceinline__ void fwd_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void fwd_cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
+template <int N> __device__ __forceinline__ void fwd_cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
 template <int DQK, int DVO>
 struct alignas(256) FwdSmemLayout {
     static constexpr size_t q_off = 0;
     static constexpr size_t q_sz  = FWD_BM * DQK * sizeof(__nv_bfloat16);
-    static constexpr size_t k_off = q_off + ((q_sz + 255) / 256) * 256;
+    // K/V are DOUBLE-buffered for cp.async pipelining.
+    static constexpr size_t k0_off = q_off + ((q_sz + 255) / 256) * 256;
     static constexpr size_t k_sz  = FWD_BN * DQK * sizeof(__nv_bfloat16);
-    static constexpr size_t v_off = k_off + ((k_sz + 255) / 256) * 256;
+    static constexpr size_t k1_off = k0_off + ((k_sz + 255) / 256) * 256;
+    static constexpr size_t v0_off = k1_off + ((k_sz + 255) / 256) * 256;
     static constexpr size_t v_sz  = FWD_BN * DVO * sizeof(__nv_bfloat16);
-    static constexpr size_t s_off  = v_off + ((v_sz + 255) / 256) * 256;
+    static constexpr size_t v1_off = v0_off + ((v_sz + 255) / 256) * 256;
+    static constexpr size_t s_off  = v1_off + ((v_sz + 255) / 256) * 256;
     static constexpr size_t s_sz   = FWD_BM * FWD_BN * sizeof(float);
     static constexpr size_t p_off  = s_off + ((s_sz + 255) / 256) * 256;
     static constexpr size_t p_sz   = FWD_BM * FWD_BN * sizeof(__nv_bfloat16);
@@ -70,10 +86,14 @@ template <int DQK, int DVO>
 struct FwdSmem {
     using L = FwdSmemLayout<DQK, DVO>;
     char* base;
-    __device__ __forceinline__ void init(char* b) { base = b; }
+    int cur_buf;
+    __device__ __forceinline__ void init(char* b) { base = b; cur_buf = 0; }
+    __device__ __forceinline__ void set_buffer(int c) { cur_buf = c; }
     __device__ __forceinline__ __nv_bfloat16* q()  { return reinterpret_cast<__nv_bfloat16*>(base + L::q_off); }
-    __device__ __forceinline__ __nv_bfloat16* k()  { return reinterpret_cast<__nv_bfloat16*>(base + L::k_off); }
-    __device__ __forceinline__ __nv_bfloat16* v()  { return reinterpret_cast<__nv_bfloat16*>(base + L::v_off); }
+    __device__ __forceinline__ __nv_bfloat16* k_buf(int i) { return reinterpret_cast<__nv_bfloat16*>(base + (i == 0 ? L::k0_off : L::k1_off)); }
+    __device__ __forceinline__ __nv_bfloat16* v_buf(int i) { return reinterpret_cast<__nv_bfloat16*>(base + (i == 0 ? L::v0_off : L::v1_off)); }
+    __device__ __forceinline__ __nv_bfloat16* k()  { return k_buf(cur_buf); }
+    __device__ __forceinline__ __nv_bfloat16* v()  { return v_buf(cur_buf); }
     __device__ __forceinline__ float* s()          { return reinterpret_cast<float*>(base + L::s_off); }
     __device__ __forceinline__ __nv_bfloat16* p()  { return reinterpret_cast<__nv_bfloat16*>(base + L::p_off); }
     __device__ __forceinline__ float* acc()        { return reinterpret_cast<float*>(base + L::acc_off); }
@@ -100,6 +120,24 @@ __device__ __forceinline__ void fwd_load_rows(
         for (int d = lane_id * 2; d < dim; d += 64) {
             if (d + 1 < dim) *reinterpret_cast<__nv_bfloat162*>(dr + d) = *reinterpret_cast<const __nv_bfloat162*>(sr + d);
             else if (d < dim) dr[d] = sr[d];
+        }
+    }
+}
+
+// Async cp.async.cg (16B = 8 bf16) load of `count` rows of `dim` bf16 (dim multiple of 8).
+__device__ __forceinline__ void fwd_async_load_rows(
+    __nv_bfloat16* dst, const __nv_bfloat16* src,
+    int seq_start, int start, int count, int num_heads, int head_idx, int dim) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int num_warps = FWD_NUM_THREADS / 32;
+    const int stride_token = num_heads * dim;
+    for (int r = warp_id; r < count; r += num_warps) {
+        const __nv_bfloat16* sr = src + (seq_start + start + r) * stride_token + head_idx * dim;
+        __nv_bfloat16* dr = dst + r * dim;
+        for (int d = lane_id * 8; d < dim; d += 256) {
+            if (d + 8 <= dim) fwd_cp_async_cg16(dr + d, sr + d);
+            else for (int dd = d; dd < dim && dd < d + 8; ++dd) dr[dd] = sr[dd];
         }
     }
 }
@@ -254,19 +292,40 @@ fmha_fwd_sm120_mla_kernel(
         n_block_max = min(n_block_max, (last_q + 1 + FWD_BN - 1) / FWD_BN);
     }
 
+    // cp.async double-buffered K/V pipeline: prefetch block n+1 while computing block n.
+    int cur = 0;
+    if (n_block_max > 0) {
+        const int ns0 = min(FWD_BN, seq_kv);
+        fwd_async_load_rows(smem.k_buf(0), k, kv_start, 0, ns0, num_heads, head_idx, DQK);
+        fwd_async_load_rows(smem.v_buf(0), v, kv_start, 0, ns0, num_heads, head_idx, DVO);
+        fwd_cp_async_commit();
+    }
     for (int n_block = 0; n_block < n_block_max; ++n_block) {
         const int n_start = n_block * FWD_BN;
         const int n_end = min(n_start + FWD_BN, seq_kv);
         const int n_size = n_end - n_start;
 
-        fwd_load_rows(smem.k(), k, kv_start, n_start, n_size, num_heads, head_idx, DQK);
-        fwd_load_rows(smem.v(), v, kv_start, n_start, n_size, num_heads, head_idx, DVO);
+        const bool has_next = (n_block + 1 < n_block_max);
+        if (has_next) {
+            const int nb = 1 - cur;
+            const int ns1_start = (n_block + 1) * FWD_BN;
+            const int ns1 = min(FWD_BN, seq_kv - ns1_start);
+            fwd_async_load_rows(smem.k_buf(nb), k, kv_start, ns1_start, ns1, num_heads, head_idx, DQK);
+            fwd_async_load_rows(smem.v_buf(nb), v, kv_start, ns1_start, ns1, num_heads, head_idx, DVO);
+            fwd_cp_async_commit();
+            fwd_cp_async_wait_group<1>();  // 2 groups in flight -> wait for the current (older) one
+        } else {
+            fwd_cp_async_wait_all();       // last block: drain the remaining group
+        }
         __syncthreads();
+        smem.set_buffer(cur);
 
         fwd_qk<DQK, DVO>(smem, m_size, n_size, scale);
         fwd_online_softmax<DQK, DVO>(smem, m_size, n_size, kIsCausal, m_start, n_start);
         fwd_pv<DQK, DVO>(smem, m_size, n_size);
-        __syncthreads();  // K/V smem reused next iter
+        __syncthreads();  // compute done; buffer `cur` is free for a future prefetch
+
+        if (has_next) cur = 1 - cur;
     }
 
     // finalize: O = acc / l_i ; LSE = m_i + log(l_i)

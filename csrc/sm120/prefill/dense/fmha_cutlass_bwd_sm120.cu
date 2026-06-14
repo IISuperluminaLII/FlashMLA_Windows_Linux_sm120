@@ -11,6 +11,7 @@
 #include "sm120/prefill/dense/fmha_cutlass_bwd_sm120.cuh"
 #include "sm120/prefill/dense/fmha_bwd_kernel_sm120.cuh"
 #include "sm120/prefill/dense/fmha_bwd_mla_kernel_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_mma_sm120.cuh"
 
 #include <cstdlib>
 #include <algorithm>
@@ -79,6 +80,30 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       max_seqlen_kv = total_seqlen_kv / batch_size;
     }
 
+    // EXPERIMENTAL raw mma.sync + ldmatrix backward (OPT-IN, default OFF) for A/B vs the
+    // WMMA dual kernel. 128/128 only; gated by FLASH_MLA_SM120_BWD_MMA=1. Reuses the same
+    // fp32 zeroed dq/dk/dv (dq accumulated via atomics, dk/dv written once).
+    {
+      static const bool kUseMmaBwd = []() {
+        const char* e = std::getenv("FLASH_MLA_SM120_BWD_MMA");
+        return (e == nullptr) || (e[0] != '0');  // DEFAULT ON; opt out with =0
+      }();
+      if (kUseMmaBwd) {
+        if (IsCausal)
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, true>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        else
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, false>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        dq.copy_(dq_float.to(dq.scalar_type()));
+        dk.copy_(dk_float.to(dk.scalar_type()));
+        dv.copy_(dv_float.to(dv.scalar_type()));
+        return;
+      }
+    }
+
     // DUAL KERNEL ARCHITECTURE for optimal performance:
     // 1. Q-major dQ kernel: Grid over Q-blocks, NO ATOMICS for dQ
     // 2. K-major dK/dV kernel: Grid over K-blocks, NO ATOMICS for dK/dV
@@ -132,6 +157,42 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   // dims (head_dim_qk=192, head_dim_vo=128); produces fp32 dQ/dK/dV (dQ via atomics
   // across KV-blocks) then casts back to the caller dtype, mirroring the 128 WMMA path.
   if constexpr (IsMla) {
+    // EXPERIMENTAL raw mma.sync + two-kernel-split backward for MLA 192/128 (OPT-IN,
+    // default OFF), gated by FLASH_MLA_SM120_BWD_MMA=1. Atomic-free; ~5x the WMMA MLA bwd.
+    {
+      static const bool kUseMmaBwd = []() {
+        const char* e = std::getenv("FLASH_MLA_SM120_BWD_MMA");
+        return (e == nullptr) || (e[0] != '0');  // DEFAULT ON; opt out with =0
+      }();
+      if (kUseMmaBwd && head_dim == 192 && v.size(-1) == 128 &&
+          q.scalar_type() == at::ScalarType::BFloat16) {
+        int max_seqlen_kv = 0;
+        if (IsVarlen) {
+          auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
+          auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
+          for (int b = 0; b < batch_size; ++b)
+            max_seqlen_kv = std::max(max_seqlen_kv, cu_kv_data[b + 1] - cu_kv_data[b]);
+        } else {
+          max_seqlen_kv = total_seqlen_kv / batch_size;
+        }
+        auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+        auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
+        auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
+        if (IsCausal)
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, true>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        else
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, false>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        dq.copy_(dq_float.to(dq.scalar_type()));
+        dk.copy_(dk_float.to(dk.scalar_type()));
+        dv.copy_(dv_float.to(dv.scalar_type()));
+        return;
+      }
+    }
+
     static const bool kUseFusedMlaBwd = []() {
       const char* e = std::getenv("FLASH_MLA_SM120_FUSED_MLA_BWD");
       return (e == nullptr) || (e[0] != '0');  // unset/anything-but-0 => ON; "0" => OFF
