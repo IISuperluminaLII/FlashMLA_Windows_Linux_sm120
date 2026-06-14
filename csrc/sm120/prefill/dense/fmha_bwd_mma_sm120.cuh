@@ -42,6 +42,33 @@ using mma_fwd::ldm_x4;
 using mma_fwd::ldm_x2;
 using mma_fwd::ldm_x2_trans;
 using mma_fwd::mma_16x8x16;
+using mma_fwd::g2s_cp;
+using mma_fwd::cp_commit;
+using mma_fwd::cp_wait_group;
+
+// ---- Preprocess: delta[token,head] = sum_d O*dO (over DVO) ------------------
+// FA-2 computes this ONCE in a separate pass (Algo 2 line 4); doing it inline in the main
+// kernels forced the O tile to stay resident in smem -> blocked cp.async. One warp/token.
+__global__ void fmha_bwd_mma_delta_kernel(
+    const __nv_bfloat16* __restrict__ o, const __nv_bfloat16* __restrict__ d_o,
+    float* __restrict__ delta, int n_th, int dvo) {
+    const int warps = blockDim.x / 32;
+    const int fid = blockIdx.x * warps + threadIdx.x / 32;   // flat (token*num_heads + head)
+    const int lane = threadIdx.x % 32;
+    if (fid >= n_th) return;
+    const __nv_bfloat16* op  = o   + (size_t)fid * dvo;
+    const __nv_bfloat16* dop = d_o + (size_t)fid * dvo;
+    float s = 0.f;
+    for (int d = lane * 2; d < dvo; d += 64) {
+        __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(op + d);
+        __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(dop + d);
+        s += __bfloat162float(__low2bfloat16(a)) * __bfloat162float(__low2bfloat16(b))
+           + __bfloat162float(__high2bfloat16(a)) * __bfloat162float(__high2bfloat16(b));
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if (lane == 0) delta[fid] = s;
+}
 
 constexpr int BM_M = 16, BM_N = 8, BM_K = 16;     // mma shape
 constexpr int BW_NW = 4;                          // warps/block
@@ -75,10 +102,13 @@ fmha_bwd_mma_dkdv_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ o,
     const __nv_bfloat16* __restrict__ d_o, const float* __restrict__ lse,
+    const float* __restrict__ delta,
     const int* __restrict__ cu_q, const int* __restrict__ cu_kv,
-    float* __restrict__ dk, float* __restrict__ dv,
+    __nv_bfloat16* __restrict__ dk, __nv_bfloat16* __restrict__ dv,
     int num_heads, float scale, int max_sq, int max_skv) {
-    constexpr int BM = bm_for<DQK>();
+    // BM=32 (query loop) so the cp.async double-buffered Q/dO stages fit the delta-freed
+    // smem at both MHA and MLA head dims.
+    constexpr int BM = 32;
     constexpr int PT_STRIDE = BM > 64 ? BM : 64;
     constexpr int DKQ = DQK / BM_K;      // S contraction d-tiles (12 for 192)
     constexpr int DKV = DVO / BM_K;      // dP contraction d-tiles (8)
@@ -99,12 +129,11 @@ fmha_bwd_mma_dkdv_kernel(
     const int kw0 = warp * BW_WN;
 
     extern __shared__ char smem_raw[];
-    __nv_bfloat16* Ks  = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* Vs  = Ks  + BW_BN * DQK;
-    __nv_bfloat16* Qs  = Vs  + BW_BN * DVO;
-    __nv_bfloat16* dOs = Qs  + BM * DQK;
-    __nv_bfloat16* Os  = dOs + BM * DVO;
-    __nv_bfloat16* PtS = Os  + BM * DVO;
+    __nv_bfloat16* Ks    = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* Vs    = Ks    + BW_BN * DQK;
+    __nv_bfloat16* Qbuf  = Vs    + BW_BN * DVO;     // [2][BM*DQK] cp.async double-buffer
+    __nv_bfloat16* dObuf = Qbuf  + 2 * BM * DQK;    // [2][BM*DVO]
+    __nv_bfloat16* PtS   = dObuf + 2 * BM * DVO;    // O tile dropped: delta is precomputed
     float* lseS   = reinterpret_cast<float*>(PtS + BW_BN * PT_STRIDE);
     float* deltaS = lseS + BM;
 
@@ -129,36 +158,41 @@ fmha_bwd_mma_dkdv_kernel(
     int nq = (sq + BM - 1) / BM;
     const int sk_tok = num_heads * DQK, sv_tok = num_heads * DVO;
 
+    // cp.async pipeline over Q blocks: prefetch mb0 into stage 0, then prefetch block mb+1
+    // while computing mb. After mb0 the block range is contiguous (the leading mb0 block may
+    // be fully causal-masked -> zero contribution, harmless), so a 2-stage buffer applies.
+    {
+        int ms0 = min(BM, sq - mb0 * BM);
+        g2s_cp(Qbuf,  q,   q0, mb0 * BM, ms0, num_heads, h, DQK);
+        g2s_cp(dObuf, d_o, q0, mb0 * BM, ms0, num_heads, h, DVO);
+        cp_commit();
+    }
     for (int mb = mb0; mb < nq; ++mb) {
+        const int cur = (mb - mb0) & 1;
+        __nv_bfloat16* Qs  = Qbuf  + cur * (BM * DQK);
+        __nv_bfloat16* dOs = dObuf + cur * (BM * DVO);
         const int m_start = mb * BM;
-        if (m_start >= sq) break;
         const int m_size = min(BM, sq - m_start);
-        if (kCausal && (m_start + m_size - 1) < n_start) continue;
 
-        bg2s(Qs,  q,   q0, m_start, m_size, num_heads, h, DQK);
-        bg2s(dOs, d_o, q0, m_start, m_size, num_heads, h, DVO);
-        bg2s(Os,  o,   q0, m_start, m_size, num_heads, h, DVO);
-        for (int m = tid; m < m_size; m += BW_THREADS)
-            lseS[m] = lse[(q0 + m_start + m) * num_heads + h];
+        if (mb + 1 < nq) {
+            const int nxt = (mb + 1 - mb0) & 1;
+            int ms2 = min(BM, sq - (mb + 1) * BM);
+            g2s_cp(Qbuf  + nxt * (BM * DQK), q,   q0, (mb + 1) * BM, ms2, num_heads, h, DQK);
+            g2s_cp(dObuf + nxt * (BM * DVO), d_o, q0, (mb + 1) * BM, ms2, num_heads, h, DVO);
+            cp_commit();
+            cp_wait_group<1>();
+        } else {
+            cp_wait_group<0>();
+        }
+        for (int m = tid; m < m_size; m += BW_THREADS) {
+            lseS[m]   = lse[(q0 + m_start + m) * num_heads + h];
+            deltaS[m] = delta[(q0 + m_start + m) * num_heads + h];   // precomputed (no O tile)
+        }
         for (int i = tid; i < (BM - m_size) * DQK; i += BW_THREADS) {
             int r = m_size + i / DQK, c = i % DQK; Qs[swz(r, c, DQK)] = __float2bfloat16(0.f);
         }
         for (int i = tid; i < (BM - m_size) * DVO; i += BW_THREADS) {
-            int r = m_size + i / DVO, c = i % DVO;
-            dOs[swz(r, c, DVO)] = __float2bfloat16(0.f);
-            Os[swz(r, c, DVO)] = __float2bfloat16(0.f);
-        }
-        __syncthreads();
-
-        for (int m = warp; m < m_size; m += BW_NW) {     // delta[m] = sum_d O*dO over DVO
-            float s = 0.f;
-            for (int d = lane; d < DVO; d += 32) {
-                int off_o = swz(m, (d / 8) * 8, DVO) + (d % 8);
-                s += __bfloat162float(Os[off_o]) * __bfloat162float(dOs[off_o]);
-            }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
-            if (lane == 0) deltaS[m] = s;
+            int r = m_size + i / DVO, c = i % DVO; dOs[swz(r, c, DVO)] = __float2bfloat16(0.f);
         }
         __syncthreads();
 
@@ -272,14 +306,14 @@ fmha_bwd_mma_dkdv_kernel(
     #pragma unroll
     for (int dd = 0; dd < DNQ; ++dd) {
         int dc = dd * BM_N + (lane % 4) * 2;
-        if (ka < n_size) { dk[(kv0+n_start+ka)*sk_tok + h*DQK + dc]=dKr[dd][0]; dk[(kv0+n_start+ka)*sk_tok + h*DQK + dc+1]=dKr[dd][1]; }
-        if (kb < n_size) { dk[(kv0+n_start+kb)*sk_tok + h*DQK + dc]=dKr[dd][2]; dk[(kv0+n_start+kb)*sk_tok + h*DQK + dc+1]=dKr[dd][3]; }
+        if (ka < n_size) { dk[(kv0+n_start+ka)*sk_tok + h*DQK + dc]=__float2bfloat16(dKr[dd][0]); dk[(kv0+n_start+ka)*sk_tok + h*DQK + dc+1]=__float2bfloat16(dKr[dd][1]); }
+        if (kb < n_size) { dk[(kv0+n_start+kb)*sk_tok + h*DQK + dc]=__float2bfloat16(dKr[dd][2]); dk[(kv0+n_start+kb)*sk_tok + h*DQK + dc+1]=__float2bfloat16(dKr[dd][3]); }
     }
     #pragma unroll
     for (int dd = 0; dd < DNV; ++dd) {
         int dc = dd * BM_N + (lane % 4) * 2;
-        if (ka < n_size) { dv[(kv0+n_start+ka)*sv_tok + h*DVO + dc]=dVr[dd][0]; dv[(kv0+n_start+ka)*sv_tok + h*DVO + dc+1]=dVr[dd][1]; }
-        if (kb < n_size) { dv[(kv0+n_start+kb)*sv_tok + h*DVO + dc]=dVr[dd][2]; dv[(kv0+n_start+kb)*sv_tok + h*DVO + dc+1]=dVr[dd][3]; }
+        if (ka < n_size) { dv[(kv0+n_start+ka)*sv_tok + h*DVO + dc]=__float2bfloat16(dVr[dd][0]); dv[(kv0+n_start+ka)*sv_tok + h*DVO + dc+1]=__float2bfloat16(dVr[dd][1]); }
+        if (kb < n_size) { dv[(kv0+n_start+kb)*sv_tok + h*DVO + dc]=__float2bfloat16(dVr[dd][2]); dv[(kv0+n_start+kb)*sv_tok + h*DVO + dc+1]=__float2bfloat16(dVr[dd][3]); }
     }
 }
 
@@ -292,13 +326,14 @@ fmha_bwd_mma_dq_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ o,
     const __nv_bfloat16* __restrict__ d_o, const float* __restrict__ lse,
+    const float* __restrict__ delta,
     const int* __restrict__ cu_q, const int* __restrict__ cu_kv,
-    float* __restrict__ dq, int num_heads, float scale, int max_sq, int max_skv) {
+    __nv_bfloat16* __restrict__ dq, int num_heads, float scale, int max_sq, int max_skv) {
     // Queries are warp-partitioned (16/warp) -> BM MUST be NW*16 = 64. For MLA the smem is
     // kept under 99KB by shrinking the KV LOOP block (BNB) instead of the query tile.
     constexpr int BM = BW_NW * BM_M;     // 64 queries per CTA (4 warps x 16)
-    constexpr int BNB = (DQK > 128) ? 32 : 64;        // KV loop block
-    constexpr int DS_STRIDE = BNB > 64 ? BNB : 64;    // DsS stride >= 64 for swz validity
+    constexpr int BNB = 32;              // KV loop block (cp.async double-buffer; fits smem)
+    constexpr int DS_STRIDE = BNB > 64 ? BNB : 64;    // 64; DsS stride >= 64 for swz validity
     constexpr int BW_WM = BM / BW_NW;    // 16 queries per warp
     constexpr int DKQ = DQK / BM_K;      // S contraction d-tiles (12 for 192)
     constexpr int DKV = DVO / BM_K;      // dP contraction d-tiles (8)
@@ -317,31 +352,22 @@ fmha_bwd_mma_dq_kernel(
     const int qw0 = warp * BW_WM;
 
     extern __shared__ char smem_raw[];
-    __nv_bfloat16* Qs  = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* dOs = Qs  + BM * DQK;
-    __nv_bfloat16* Os  = dOs + BM * DVO;
-    __nv_bfloat16* Ks  = Os  + BM * DVO;
-    __nv_bfloat16* Vs  = Ks  + BNB * DQK;
-    __nv_bfloat16* DsS = Vs  + BNB * DVO;
+    __nv_bfloat16* Qs    = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* dOs   = Qs    + BM * DQK;        // O tile dropped: delta is precomputed
+    __nv_bfloat16* Kbuf  = dOs   + BM * DVO;        // [2][BNB*DQK] cp.async double-buffer
+    __nv_bfloat16* Vbuf  = Kbuf  + 2 * BNB * DQK;   // [2][BNB*DVO]
+    __nv_bfloat16* DsS   = Vbuf  + 2 * BNB * DVO;
     float* lseS   = reinterpret_cast<float*>(DsS + BM * DS_STRIDE);
     float* deltaS = lseS + BM;
 
     bg2s(Qs,  q,   q0, m_start, m_size, num_heads, h, DQK);
     bg2s(dOs, d_o, q0, m_start, m_size, num_heads, h, DVO);
-    bg2s(Os,  o,   q0, m_start, m_size, num_heads, h, DVO);
-    for (int m = tid; m < m_size; m += BW_THREADS)
-        lseS[m] = lse[(q0 + m_start + m) * num_heads + h];
-    for (int i = tid; i < (BM - m_size) * DQK; i += BW_THREADS) { int r=m_size+i/DQK, c=i%DQK; Qs[swz(r,c,DQK)]=__float2bfloat16(0.f); }
-    for (int i = tid; i < (BM - m_size) * DVO; i += BW_THREADS) { int r=m_size+i/DVO, c=i%DVO; dOs[swz(r,c,DVO)]=__float2bfloat16(0.f); Os[swz(r,c,DVO)]=__float2bfloat16(0.f); }
-    __syncthreads();
-
-    for (int m = warp; m < m_size; m += BW_NW) {        // delta[m] over DVO
-        float s = 0.f;
-        for (int d = lane; d < DVO; d += 32) { int off=swz(m,(d/8)*8,DVO)+(d%8); s += __bfloat162float(Os[off])*__bfloat162float(dOs[off]); }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
-        if (lane == 0) deltaS[m] = s;
+    for (int m = tid; m < m_size; m += BW_THREADS) {
+        lseS[m]   = lse[(q0 + m_start + m) * num_heads + h];
+        deltaS[m] = delta[(q0 + m_start + m) * num_heads + h];   // precomputed (no O tile)
     }
+    for (int i = tid; i < (BM - m_size) * DQK; i += BW_THREADS) { int r=m_size+i/DQK, c=i%DQK; Qs[swz(r,c,DQK)]=__float2bfloat16(0.f); }
+    for (int i = tid; i < (BM - m_size) * DVO; i += BW_THREADS) { int r=m_size+i/DVO, c=i%DVO; dOs[swz(r,c,DVO)]=__float2bfloat16(0.f); }
     __syncthreads();
 
     // Q (DQK) and dO (DVO) A-fragments for this warp's 16 queries, reused across KV loop.
@@ -362,11 +388,28 @@ fmha_bwd_mma_dq_kernel(
     if (kCausal) { int last_q = m_start + m_size - 1; nb_max = min(nb_max, (last_q + 1 + BNB - 1) / BNB); }
     const int sq_tok = num_heads * DQK;
 
+    {   // cp.async prologue: prefetch KV block 0
+        int ns0 = min(BNB, skv);
+        g2s_cp(Kbuf, k, kv0, 0, ns0, num_heads, h, DQK);
+        g2s_cp(Vbuf, v, kv0, 0, ns0, num_heads, h, DVO);
+        cp_commit();
+    }
     for (int nb = 0; nb < nb_max; ++nb) {
+        const int cur = nb & 1;
+        __nv_bfloat16* Ks = Kbuf + cur * (BNB * DQK);
+        __nv_bfloat16* Vs = Vbuf + cur * (BNB * DVO);
         const int n_start = nb * BNB;
         const int n_size = min(BNB, skv - n_start);
-        bg2s(Ks, k, kv0, n_start, n_size, num_heads, h, DQK);
-        bg2s(Vs, v, kv0, n_start, n_size, num_heads, h, DVO);
+        if (nb + 1 < nb_max) {
+            const int nxt = (nb + 1) & 1;
+            int ns2 = min(BNB, skv - (nb + 1) * BNB);
+            g2s_cp(Kbuf + nxt * (BNB * DQK), k, kv0, (nb + 1) * BNB, ns2, num_heads, h, DQK);
+            g2s_cp(Vbuf + nxt * (BNB * DVO), v, kv0, (nb + 1) * BNB, ns2, num_heads, h, DVO);
+            cp_commit();
+            cp_wait_group<1>();
+        } else {
+            cp_wait_group<0>();
+        }
         for (int i = tid; i < (BNB - n_size) * DQK; i += BW_THREADS) { int r=n_size+i/DQK, c=i%DQK; Ks[swz(r,c,DQK)]=__float2bfloat16(0.f); }
         for (int i = tid; i < (BNB - n_size) * DVO; i += BW_THREADS) { int r=n_size+i/DVO, c=i%DVO; Vs[swz(r,c,DVO)]=__float2bfloat16(0.f); }
         __syncthreads();
@@ -425,8 +468,8 @@ fmha_bwd_mma_dq_kernel(
     #pragma unroll
     for (int dd = 0; dd < DNQ; ++dd) {
         int dc = dd * BM_N + (lane % 4) * 2;
-        if (qa < m_size) { dq[(q0+m_start+qa)*sq_tok + h*DQK + dc]=dQr[dd][0]; dq[(q0+m_start+qa)*sq_tok + h*DQK + dc+1]=dQr[dd][1]; }
-        if (qb < m_size) { dq[(q0+m_start+qb)*sq_tok + h*DQK + dc]=dQr[dd][2]; dq[(q0+m_start+qb)*sq_tok + h*DQK + dc+1]=dQr[dd][3]; }
+        if (qa < m_size) { dq[(q0+m_start+qa)*sq_tok + h*DQK + dc]=__float2bfloat16(dQr[dd][0]); dq[(q0+m_start+qa)*sq_tok + h*DQK + dc+1]=__float2bfloat16(dQr[dd][1]); }
+        if (qb < m_size) { dq[(q0+m_start+qb)*sq_tok + h*DQK + dc]=__float2bfloat16(dQr[dd][2]); dq[(q0+m_start+qb)*sq_tok + h*DQK + dc+1]=__float2bfloat16(dQr[dd][3]); }
     }
 }
 
@@ -437,9 +480,10 @@ void launch_fmha_bwd_mma(const c10::cuda::CUDAStream& stream,
                          at::Tensor o, at::Tensor lse, at::Tensor cu_q, at::Tensor cu_kv,
                          at::Tensor dq, at::Tensor dk, at::Tensor dv,
                          float scale, int max_sq, int max_skv) {
-    constexpr int BM = bm_for<DQK>();
+    constexpr int BM = 32;   // kernel A query loop (matches the kernel; cp.async double-buf)
     constexpr int PT_STRIDE = BM > 64 ? BM : 64;
     const int batch = cu_q.size(0) - 1, num_heads = q.size(1);
+    const int total_q = q.size(0);
     const auto qp = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr());
     const auto kp = reinterpret_cast<const __nv_bfloat16*>(k.data_ptr());
     const auto vp = reinterpret_cast<const __nv_bfloat16*>(v.data_ptr());
@@ -448,25 +492,37 @@ void launch_fmha_bwd_mma(const c10::cuda::CUDAStream& stream,
     const auto lp = lse.data_ptr<float>();
     const auto cq = cu_q.data_ptr<int>(); const auto ck = cu_kv.data_ptr<int>();
 
+    // Preprocess: delta[token,head] = sum_d O*dO. One pass; frees the O smem tile in the
+    // two main kernels so they can cp.async-pipeline the looped operand.
+    auto delta = at::empty({total_q, num_heads}, q.options().dtype(at::kFloat));
+    const auto dp = delta.data_ptr<float>();
+    {
+        const int n_th = total_q * num_heads;
+        const int tpb = 256;                          // 8 warps -> 8 tokens/block
+        const int gb = (n_th + (tpb / 32) - 1) / (tpb / 32);
+        fmha_bwd_mma_delta_kernel<<<gb, tpb, 0, stream.stream()>>>(op, dop, dp, n_th, DVO);
+    }
+
     {   // Kernel A: dK/dV, grid over KV blocks
         const int nblocks = (max_skv + BW_BN - 1) / BW_BN;
         dim3 grid(nblocks, num_heads, batch);
-        size_t smem = (BW_BN * DQK + BW_BN * DVO + BM * DQK + 2 * BM * DVO + BW_BN * PT_STRIDE) * sizeof(__nv_bfloat16) + (2 * BM) * sizeof(float);
+        size_t smem = (BW_BN * DQK + BW_BN * DVO + 2 * BM * DQK + 2 * BM * DVO + BW_BN * PT_STRIDE) * sizeof(__nv_bfloat16) + (2 * BM) * sizeof(float);
         auto kern = fmha_bwd_mma_dkdv_kernel<DQK, DVO, kCausal>;
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, cq, ck, dk.data_ptr<float>(), dv.data_ptr<float>(), num_heads, scale, max_sq, max_skv);
+        kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, dp, cq, ck,
+            reinterpret_cast<__nv_bfloat16*>(dk.data_ptr()), reinterpret_cast<__nv_bfloat16*>(dv.data_ptr()), num_heads, scale, max_sq, max_skv);
     }
-    {   // Kernel B: dQ, grid over Q blocks. Queries warp-partitioned -> BMB=64; KV loop
-        // block BNB shrinks for MLA smem; DsS padded to >=64 for swz.
+    {   // Kernel B: dQ, grid over Q blocks (queries warp-partitioned -> BMB=64; KV loop BNB).
         constexpr int BMB = BW_NW * BM_M;            // 64
-        constexpr int BNB = (DQK > 128) ? 32 : 64;
+        constexpr int BNB = 32;
         constexpr int DSST = BNB > 64 ? BNB : 64;
         const int nblocks = (max_sq + BMB - 1) / BMB;
         dim3 grid(nblocks, num_heads, batch);
-        size_t smem = (BMB * DQK + 2 * BMB * DVO + BNB * DQK + BNB * DVO + BMB * DSST) * sizeof(__nv_bfloat16) + (2 * BMB) * sizeof(float);
+        size_t smem = (BMB * DQK + BMB * DVO + 2 * BNB * DQK + 2 * BNB * DVO + BMB * DSST) * sizeof(__nv_bfloat16) + (2 * BMB) * sizeof(float);
         auto kern = fmha_bwd_mma_dq_kernel<DQK, DVO, kCausal>;
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, cq, ck, dq.data_ptr<float>(), num_heads, scale, max_sq, max_skv);
+        kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, dp, cq, ck,
+            reinterpret_cast<__nv_bfloat16*>(dq.data_ptr()), num_heads, scale, max_sq, max_skv);
     }
 }
 

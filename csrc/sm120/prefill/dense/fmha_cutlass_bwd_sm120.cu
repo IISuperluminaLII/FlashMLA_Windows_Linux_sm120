@@ -59,16 +59,9 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
                       q.scalar_type() == at::ScalarType::BFloat16;
 
   if (can_use_wmma) {
-    // Create float32 tensors for atomic accumulation
-    // K-major kernel: dQ needs atomics (float), dK/dV don't (accumulated in smem)
-    auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
-    auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
-    auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
-
     // Compute max_seqlen_kv for grid sizing
     int max_seqlen_kv = 0;
     if (IsVarlen) {
-      // For varlen, find max from cu_seqlens
       auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
       auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
       for (int b = 0; b < batch_size; ++b) {
@@ -76,13 +69,11 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
         if (seq_len > max_seqlen_kv) max_seqlen_kv = seq_len;
       }
     } else {
-      // For non-varlen, uniform sequence length
       max_seqlen_kv = total_seqlen_kv / batch_size;
     }
 
-    // EXPERIMENTAL raw mma.sync + ldmatrix backward (OPT-IN, default OFF) for A/B vs the
-    // WMMA dual kernel. 128/128 only; gated by FLASH_MLA_SM120_BWD_MMA=1. Reuses the same
-    // fp32 zeroed dq/dk/dv (dq accumulated via atomics, dk/dv written once).
+    // raw mma.sync two-kernel-split backward (DEFAULT ON; opt out FLASH_MLA_SM120_BWD_MMA=0).
+    // Atomic-free -> writes bf16 dq/dk/dv DIRECTLY (no fp32 scratch, no .to() copy).
     {
       static const bool kUseMmaBwd = []() {
         const char* e = std::getenv("FLASH_MLA_SM120_BWD_MMA");
@@ -92,17 +83,19 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
         if (IsCausal)
           flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, true>(
               stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
-              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
         else
           flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, false>(
               stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
-              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
-        dq.copy_(dq_float.to(dq.scalar_type()));
-        dk.copy_(dk_float.to(dk.scalar_type()));
-        dv.copy_(dv_float.to(dv.scalar_type()));
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
         return;
       }
     }
+
+    // WMMA fallback path uses fp32 atomic accumulation (dq) + fp32->bf16 cast.
+    auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+    auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
+    auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
 
     // DUAL KERNEL ARCHITECTURE for optimal performance:
     // 1. Q-major dQ kernel: Grid over Q-blocks, NO ATOMICS for dQ
@@ -175,20 +168,14 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
         } else {
           max_seqlen_kv = total_seqlen_kv / batch_size;
         }
-        auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
-        auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
-        auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
         if (IsCausal)
           flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, true>(
               stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
-              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
         else
           flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, false>(
               stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
-              dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
-        dq.copy_(dq_float.to(dq.scalar_type()));
-        dk.copy_(dk_float.to(dk.scalar_type()));
-        dv.copy_(dv_float.to(dv.scalar_type()));
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
         return;
       }
     }
