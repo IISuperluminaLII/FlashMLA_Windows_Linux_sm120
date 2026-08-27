@@ -31,6 +31,7 @@
 #include "fwd.h"
 #include "traits.h"
 #include "params.h"
+#include "fwd_mma.cuh"   // CFG>=4: raw mma.sync + ldmatrix + cp.async sparse kernel (F1 tier)
 
 using namespace cute;
 using namespace nvcuda;
@@ -709,12 +710,19 @@ void run_sparse_fwd_kernel(const SparsePrefillParams& params) {
     // Runtime config selection (build once, A/B at runtime; default 0 = byte-identical
     // legacy codegen). FLASH_MLA_SM120_SPARSE_FWD_CFG:
     //   0 (default) legacy; 1 = A0 register-rO; 2 = +A1 persistent QK frags + 8-warp WMMA;
-    //   3 = +A2/A3/A4 parallel base-2 softmax + closed-form PV write-back.
+    //   3 = +A2/A3/A4 parallel base-2 softmax + closed-form PV write-back;
+    //   4 = F1: raw mma.sync + ldmatrix + XOR swizzle + cp.async gather pipeline
+    //       (fwd_mma.cuh -- resident Q, streamed gathered KV, V-share semantics).
     static const int fwd_cfg = []() {
         const char* e = getenv("FLASH_MLA_SM120_SPARSE_FWD_CFG");
         int v = e ? atoi(e) : 0;
-        return (v < 0 || v > 3) ? 0 : v;
+        return (v < 0 || v > 4) ? 0 : v;
     }();
+
+    if (fwd_cfg == 4) {
+        sparse_mma::launch_sparse_fwd_mma(params);
+        return;
+    }
 
     auto launch = [&](auto kernel_fn) {
         if (smem_size > 48 * 1024) {

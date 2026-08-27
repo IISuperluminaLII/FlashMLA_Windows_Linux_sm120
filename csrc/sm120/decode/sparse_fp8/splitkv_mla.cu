@@ -32,11 +32,22 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>   // fprintf/stderr used by CHECK_CUDA from csrc/utils.h
+#include <cstdlib>  // getenv/atoi for the CFG ladder gate
 
 namespace sm120 {
 namespace sparse_decode {
 
 using namespace nvcuda;
+
+}  // namespace sparse_decode
+}  // namespace sm120
+
+// mma.sync tier (CFG=1): raw mma.sync + ldmatrix + cp.async port of the WMMA kernel
+// below. Needs traits.h/dequant.h/params.h symbols from sm120::sparse_decode.
+#include "splitkv_mla_mma.cuh"
+
+namespace sm120 {
+namespace sparse_decode {
 
 //==============================================================================
 // Cooperative tile loaders (all 256 threads: token = tid/4, 16-elem chunk = tid%4)
@@ -322,6 +333,18 @@ sparse_fp8_decode_kernel(const SparseFP8DecodeParams params) {
 // Launcher
 //==============================================================================
 void run_sparse_fp8_decode_kernel(const SparseFP8DecodeParams& params) {
+    // CFG ladder (FLASH_MLA_SM120_SPARSE_DECODE_CFG): 0 = legacy WMMA (default,
+    // byte-identical), 1 = raw mma.sync + ldmatrix + cp.async (splitkv_mla_mma.cuh).
+    static const int decode_cfg = [] {
+        const char* e = getenv("FLASH_MLA_SM120_SPARSE_DECODE_CFG");
+        const int v = e ? atoi(e) : 0;
+        return v < 0 ? 0 : (v > 1 ? 1 : v);
+    }();
+    if (decode_cfg == 1) {
+        mma::launch_sparse_fp8_decode_mma(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
     const int num_m_blocks = (params.q_head_per_hk + BLOCK_M - 1) / BLOCK_M;
     const dim3 grid(num_m_blocks, params.s_q, params.b);
     const dim3 block(NUM_THREADS);
