@@ -1,13 +1,6 @@
 #pragma once
-// SM120 Sparse FP8 Decode - Interface header
-
-#include "traits.h"
-
-namespace sm120 {
-namespace sparse_decode {
-
-// Launch sparse FP8 decode kernel
-void run_sparse_fp8_decode_kernel(const SparseFP8DecodeParams& params);
-
-} // namespace sparse_decode
-} // namespace sm120
+// SM120 Sparse FP8 Decode - Interface header.
+// MSVC-safe: includes ONLY the POD params header (no CUTLASS, no mma.h), matching the
+// dense decode's params.h/splitkv_mla.h split. traits.h is device-only and is included
+// exclusively by splitkv_mla.cu.
+#include "params.h"

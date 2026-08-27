@@ -42,6 +42,25 @@ bf16x8 cvt_fp8x8_bf16x8(const fp8x8 &inputs, const float &scale) {
     return result;
 }
 
+// Convert 8 FP8 elements to 8 BF16 elements with an FP32-domain scale multiply.
+// Bit-identical to the oracle's quantization round trip (tests/quant.py:61-63:
+// fp8.to(fp32) * fp32_scale -> bf16, single RN rounding step). The bf16-domain variant
+// above (sm90 convention) first rounds the scale to bf16 -- a systematic <=2^-9 error
+// shared by all 128 elements of a quant tile; the decode lse tolerance (rel 1.2e-4,
+// cos 1e-7) is the tightest in the suite, so we do not spend that margin.
+// audit/design-sparse-decode.md D-12 / section 5.4.
+__device__ __forceinline__
+bf16x8 cvt_fp8x8_bf16x8_fp32(const fp8x8 &inputs, const float &scale) {
+    float4 lo = (float4)(inputs.lo);
+    float4 hi = (float4)(inputs.hi);
+    bf16x8 r;
+    r.a = __floats2bfloat162_rn(lo.x * scale, lo.y * scale);
+    r.b = __floats2bfloat162_rn(lo.z * scale, lo.w * scale);
+    r.c = __floats2bfloat162_rn(hi.x * scale, hi.y * scale);
+    r.d = __floats2bfloat162_rn(hi.z * scale, hi.w * scale);
+    return r;
+}
+
 // Load 128 bits (16 FP8 elements) from global memory
 template<typename T>
 __device__ __forceinline__

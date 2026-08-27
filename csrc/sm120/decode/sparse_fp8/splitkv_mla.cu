@@ -1,566 +1,340 @@
-// SM120 Sparse FP8 Decode Kernel
-// WMMA-based implementation for Blackwell workstation GPUs
+/***************************************************************************************************
+ * SM120 Sparse-FP8 Decode Kernel - full rewrite (WMMA, batch-parallel, no split-KV phase 1).
+ * Design: audit/design-sparse-decode.md (implementation-ready; decisions D-1..D-12).
+ *
+ * Semantics (faithful to the authors' sm90 sparse-fp8 decode):
+ *   For request b, query position s, over its topk selected tokens t (indices[b][s][:]):
+ *     S[h,t] = Q[h,:] . K[t,:]                 (full 576: dequantized nope + bf16 rope)
+ *     P      = softmax over VALID t (global online softmax, base-2 domain, -1e30 init)
+ *     O[h,:] = sum_t P[h,t] * V[t,:]           (V = dequantized FIRST 512 of the row)
+ *     lse    = (L==0) ? +inf : ln(L) + M2/log2(e)     [NATURAL log final sink]
+ *
+ *   - NO block_table: indices address the paged cache directly, page = idx/64, offset = idx%64
+ *     (README.md: "the kernel does not require the block_table parameter").
+ *   - token == -1 is the ONLY invalid form (decode convention); no address is ever formed for
+ *     it and its K/V smem lanes are HARD-ZEROED (the oracle NaN-poisons every unreferenced
+ *     token, and 0 * NaN = NaN would otherwise poison the GEMMs).
+ *   - All KV address arithmetic in int64_t: page * kv_page_stride(41,984) exceeds INT32_MAX
+ *     at the authors' own perf shapes (pool > ~51K pages).
+ *   - WMMA fragments are touched ONLY via fill/load/store_matrix_sync/mma_sync -- zero
+ *     hand-indexing of frag.x[] (the root cause of the previous placeholder's garbage).
+ *
+ * Grid: dim3(ceil(q_head_per_hk/64), s_q, b), 256 threads, 1 CTA/SM (98.4 KiB smem).
+ **************************************************************************************************/
 
-#include "splitkv_mla.h"
+#include "params.h"
+#include "traits.h"
 #include "dequant.h"
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "../../../utils.h"
+
 #include <mma.h>
+#include <cuda_bf16.h>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>   // fprintf/stderr used by CHECK_CUDA from csrc/utils.h
 
 namespace sm120 {
 namespace sparse_decode {
 
-using namespace nvcuda::wmma;
+using namespace nvcuda;
 
-// WMMA fragment types for 16x16x16 operations
-using FragA_QK = fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major>;
-using FragB_QK = fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major>;  // K^T
-using FragC_QK = fragment<accumulator, 16, 16, 16, float>;
+//==============================================================================
+// Cooperative tile loaders (all 256 threads: token = tid/4, 16-elem chunk = tid%4)
+//==============================================================================
 
-using FragA_PV = fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major>;  // S
-using FragB_PV = fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major>;  // V
-using FragC_PV = fragment<accumulator, 16, 16, 16, float>;
-
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-// Load Q tile from global to shared memory
-__device__ __forceinline__
-void load_q_tile(
-    const bf16* __restrict__ q_global,
-    bf16 q_tile[BLOCK_M][SharedMemoryLayout::Q_TILE_COLS],
-    int tile_idx,
-    int head_dim,
-    int num_threads
-) {
-    const int tid = threadIdx.x;
-    const int col_start = tile_idx * SharedMemoryLayout::Q_TILE_COLS;
-    const int cols_this_tile = min(SharedMemoryLayout::Q_TILE_COLS, head_dim - col_start);
-
-    // Each thread loads multiple elements
-    const int elems_per_thread = (BLOCK_M * SharedMemoryLayout::Q_TILE_COLS + num_threads - 1) / num_threads;
-
-    #pragma unroll 4
-    for (int i = 0; i < elems_per_thread; i++) {
-        int elem_idx = tid + i * num_threads;
-        int row = elem_idx / SharedMemoryLayout::Q_TILE_COLS;
-        int col = elem_idx % SharedMemoryLayout::Q_TILE_COLS;
-
-        if (row < BLOCK_M && col < cols_this_tile) {
-            q_tile[row][col] = q_global[row * head_dim + col_start + col];
-        } else if (row < BLOCK_M && col < SharedMemoryLayout::Q_TILE_COLS) {
-            q_tile[row][col] = bf16(0.0f);  // Pad with zeros
-        }
+// Gather + dequant one 64-wide column tile of the fp8 nope region into sKV[64][64].
+// Serves the K d-tiles 0..7 of QK AND all 8 V column tiles of PV (V aliases nope).
+// One fp32 scale per tile: a 64-aligned 64-wide range never crosses a 128-elem quant tile.
+__device__ __forceinline__ void load_nope_tile(SharedMemoryPlan& sm, int col_start) {
+    const int token = threadIdx.x >> 2;
+    const int chunk = threadIdx.x & 3;
+    __nv_bfloat16* dst = &sm.sKV[token * 64 + chunk * 16];
+    const uint8_t* tp = sm.sTokPtr[token];
+    if (tp == nullptr) {                        // invalid token -> HARD ZERO (NaN-poison trap)
+        *(uint4*)(dst)     = make_uint4(0u, 0u, 0u, 0u);
+        *(uint4*)(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+        return;
     }
+    const float scale = *(const float*)(tp + HEAD_DIM_NOPE + 4 * (col_start >> 7));
+    const fp8x16 raw  = load_128b<fp8x16>(tp + col_start + chunk * 16);
+    const bf16x8 lo = cvt_fp8x8_bf16x8_fp32(raw.lo, scale);
+    const bf16x8 hi = cvt_fp8x8_bf16x8_fp32(raw.hi, scale);
+    store_128b(dst,     lo);
+    store_128b(dst + 8, hi);
 }
 
-// Load K tile from FP8 global memory with dequantization
-// K is stored as: [page][token][FP8_NOPE | scales | BF16_ROPE]
-__device__ __forceinline__
-void load_k_tile_fp8(
-    const fp8* __restrict__ kv_ptr,
-    bf16 k_tile[TOPK_BLOCK_SIZE][SharedMemoryLayout::K_TILE_COLS],
-    const int* __restrict__ indices,
-    bool* __restrict__ is_valid,
-    int tile_idx,
-    int topk,
-    int page_size,
-    int kv_token_stride,
-    const int* __restrict__ block_table,
-    int num_threads
-) {
-    const int tid = threadIdx.x;
-    const int col_start = tile_idx * SharedMemoryLayout::K_TILE_COLS;
-
-    // Each thread handles one or more tokens
-    const int tokens_per_thread = (TOPK_BLOCK_SIZE + num_threads - 1) / num_threads;
-
-    #pragma unroll 2
-    for (int t = 0; t < tokens_per_thread; t++) {
-        int token_local = tid + t * num_threads;
-        if (token_local >= TOPK_BLOCK_SIZE) break;
-
-        // Get token index from sparse indices
-        int token_idx = (token_local < topk) ? indices[token_local] : -1;
-        bool valid = (token_idx >= 0);
-        is_valid[token_local] = valid;
-
-        if (!valid) {
-            // Invalid token - fill with zeros
-            #pragma unroll 4
-            for (int c = 0; c < SharedMemoryLayout::K_TILE_COLS; c += 8) {
-                *reinterpret_cast<float4*>(&k_tile[token_local][c]) = make_float4(0, 0, 0, 0);
-            }
-            continue;
-        }
-
-        // Calculate page and offset
-        int page_idx = token_idx / page_size;
-        int token_in_page = token_idx % page_size;
-        int page = block_table[page_idx];
-
-        const fp8* token_ptr = kv_ptr + page * page_size * kv_token_stride + token_in_page * kv_token_stride;
-
-        // Load scales (4 floats for 512 elements, 128 elements per scale)
-        float4 scales = *reinterpret_cast<const float4*>(token_ptr + HEAD_DIM_NOPE);
-
-        // Dequantize FP8 to BF16 for this tile
-        // col_start determines which part of the 576-dim vector we're loading
-        if (col_start < HEAD_DIM_NOPE) {
-            // Loading from FP8 NOPE region
-            int fp8_col = col_start;
-            int scale_idx = fp8_col / QUANT_TILE_SIZE;
-            float scale = (scale_idx == 0) ? scales.x : (scale_idx == 1) ? scales.y :
-                          (scale_idx == 2) ? scales.z : scales.w;
-
-            // Load 64 FP8 elements (4 x fp8x16)
-            #pragma unroll 4
-            for (int c = 0; c < SharedMemoryLayout::K_TILE_COLS; c += 16) {
-                if (fp8_col + c < HEAD_DIM_NOPE) {
-                    fp8x16 fp8_data = load_128b<fp8x16>(token_ptr + fp8_col + c);
-
-                    // Determine scale for this chunk
-                    int chunk_scale_idx = (fp8_col + c) / QUANT_TILE_SIZE;
-                    float chunk_scale = (chunk_scale_idx == 0) ? scales.x : (chunk_scale_idx == 1) ? scales.y :
-                                        (chunk_scale_idx == 2) ? scales.z : scales.w;
-
-                    bf16x8 bf16_lo = cvt_fp8x8_bf16x8(fp8_data.lo, chunk_scale);
-                    bf16x8 bf16_hi = cvt_fp8x8_bf16x8(fp8_data.hi, chunk_scale);
-
-                    store_128b(&k_tile[token_local][c], bf16_lo);
-                    store_128b(&k_tile[token_local][c + 8], bf16_hi);
-                }
-            }
-        } else {
-            // Loading from BF16 ROPE region
-            int rope_col = col_start - HEAD_DIM_NOPE;
-            const bf16* rope_ptr = reinterpret_cast<const bf16*>(
-                token_ptr + HEAD_DIM_NOPE + NUM_SCALES * sizeof(float));
-
-            #pragma unroll 4
-            for (int c = 0; c < SharedMemoryLayout::K_TILE_COLS; c += 8) {
-                if (rope_col + c < HEAD_DIM_ROPE) {
-                    *reinterpret_cast<float4*>(&k_tile[token_local][c]) =
-                        *reinterpret_cast<const float4*>(rope_ptr + rope_col + c);
-                } else {
-                    *reinterpret_cast<float4*>(&k_tile[token_local][c]) = make_float4(0, 0, 0, 0);
-                }
-            }
-        }
+// Gather the 64 unquantized bf16 rope elements (bytes [528,656) of the row) into sKV[64][64].
+__device__ __forceinline__ void load_rope_tile(SharedMemoryPlan& sm) {
+    const int token = threadIdx.x >> 2;
+    const int chunk = threadIdx.x & 3;
+    __nv_bfloat16* dst = &sm.sKV[token * 64 + chunk * 16];
+    const uint8_t* tp = sm.sTokPtr[token];
+    if (tp == nullptr) {
+        *(uint4*)(dst)     = make_uint4(0u, 0u, 0u, 0u);
+        *(uint4*)(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+        return;
     }
+    const uint8_t* rp = tp + HEAD_DIM_NOPE + NUM_SCALES * (int)sizeof(float);   // byte +528
+    *(uint4*)(dst)     = *(const uint4*)(rp + chunk * 32);        // 8 bf16
+    *(uint4*)(dst + 8) = *(const uint4*)(rp + chunk * 32 + 16);   // 8 bf16
 }
 
-// Load V tile from FP8 storage (V is the NOPE part only, 512 dims)
-__device__ __forceinline__
-void load_v_tile_fp8(
-    const fp8* __restrict__ kv_ptr,
-    bf16 v_tile[TOPK_BLOCK_SIZE][SharedMemoryLayout::V_TILE_COLS],
-    const int* __restrict__ indices,
-    const bool* __restrict__ is_valid,
-    int tile_idx,
-    int topk,
-    int page_size,
-    int kv_token_stride,
-    const int* __restrict__ block_table,
-    int num_threads
-) {
-    const int tid = threadIdx.x;
-    const int col_start = tile_idx * SharedMemoryLayout::V_TILE_COLS;
-
-    const int tokens_per_thread = (TOPK_BLOCK_SIZE + num_threads - 1) / num_threads;
-
-    #pragma unroll 2
-    for (int t = 0; t < tokens_per_thread; t++) {
-        int token_local = tid + t * num_threads;
-        if (token_local >= TOPK_BLOCK_SIZE) break;
-
-        if (!is_valid[token_local]) {
-            #pragma unroll 4
-            for (int c = 0; c < SharedMemoryLayout::V_TILE_COLS; c += 8) {
-                *reinterpret_cast<float4*>(&v_tile[token_local][c]) = make_float4(0, 0, 0, 0);
-            }
-            continue;
-        }
-
-        int token_idx = indices[token_local];
-        int page_idx = token_idx / page_size;
-        int token_in_page = token_idx % page_size;
-        int page = block_table[page_idx];
-
-        const fp8* token_ptr = kv_ptr + page * page_size * kv_token_stride + token_in_page * kv_token_stride;
-        float4 scales = *reinterpret_cast<const float4*>(token_ptr + HEAD_DIM_NOPE);
-
-        // V uses the same FP8 NOPE region as K's first 512 dims
-        int scale_idx = col_start / QUANT_TILE_SIZE;
-
-        #pragma unroll 4
-        for (int c = 0; c < SharedMemoryLayout::V_TILE_COLS; c += 16) {
-            int abs_col = col_start + c;
-            if (abs_col < HEAD_DIM_V) {
-                fp8x16 fp8_data = load_128b<fp8x16>(token_ptr + abs_col);
-
-                int chunk_scale_idx = abs_col / QUANT_TILE_SIZE;
-                float chunk_scale = (chunk_scale_idx == 0) ? scales.x : (chunk_scale_idx == 1) ? scales.y :
-                                    (chunk_scale_idx == 2) ? scales.z : scales.w;
-
-                bf16x8 bf16_lo = cvt_fp8x8_bf16x8(fp8_data.lo, chunk_scale);
-                bf16x8 bf16_hi = cvt_fp8x8_bf16x8(fp8_data.hi, chunk_scale);
-
-                store_128b(&v_tile[token_local][c], bf16_lo);
-                store_128b(&v_tile[token_local][c + 8], bf16_hi);
-            }
-        }
-    }
-}
-
-// WMMA-based Q @ K^T computation for a single 16x16 tile
-__device__ __forceinline__
-void wmma_qk_tile(
-    const bf16 q_tile[BLOCK_M][SharedMemoryLayout::Q_TILE_COLS],
-    const bf16 k_tile[TOPK_BLOCK_SIZE][SharedMemoryLayout::K_TILE_COLS],
-    float qk_accum[BLOCK_M / 16][TOPK_BLOCK_SIZE / 16][16 * 16 / 32],  // Per-warp accumulators
-    int warp_id,
-    int lane_id,
-    bool clear
-) {
-    // Each warp handles a 16x16 output tile
-    // BLOCK_M=64, TOPK_BLOCK_SIZE=64 -> 4x4 = 16 tiles, 8 warps
-    // Each warp handles 2 tiles
-
-    const int tiles_m = BLOCK_M / 16;  // 4
-    const int tiles_n = TOPK_BLOCK_SIZE / 16;  // 4
-    const int total_tiles = tiles_m * tiles_n;  // 16
-    const int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;  // 2
-
+// Load the Q-rope tile [64 heads][64] (elements 512..575 of each Q row) into sPQ.
+// sPQ is UNIONED with P; phase separation proven in the design (section 3.5).
+__device__ __forceinline__ void load_qrope_tile(SharedMemoryPlan& sm,
+                                                const __nv_bfloat16* q_row_base,
+                                                int q_row_stride, int num_valid_rows) {
     #pragma unroll
-    for (int t = 0; t < tiles_per_warp; t++) {
-        int tile_idx = warp_id * tiles_per_warp + t;
-        if (tile_idx >= total_tiles) break;
-
-        int tile_m = tile_idx / tiles_n;
-        int tile_n = tile_idx % tiles_n;
-
-        // WMMA fragments
-        FragA_QK frag_q;
-        FragB_QK frag_k;
-        FragC_QK frag_c;
-
-        if (clear) {
-            fill_fragment(frag_c, 0.0f);
-        } else {
-            // Load existing accumulator
-            #pragma unroll
-            for (int i = 0; i < frag_c.num_elements; i++) {
-                frag_c.x[i] = qk_accum[tile_m][tile_n][lane_id * frag_c.num_elements / 32 + i % (frag_c.num_elements / 32)];
-            }
-        }
-
-        // Accumulate over K dimension (64 elements in this tile)
-        const int k_tiles = SharedMemoryLayout::K_TILE_COLS / 16;  // 4
-        #pragma unroll
-        for (int k = 0; k < k_tiles; k++) {
-            // Load Q fragment: [16, 16] from q_tile[tile_m*16 : tile_m*16+16, k*16 : k*16+16]
-            load_matrix_sync(frag_q,
-                reinterpret_cast<const __nv_bfloat16*>(&q_tile[tile_m * 16][k * 16]),
-                SharedMemoryLayout::Q_TILE_COLS);
-
-            // Load K fragment (transposed): [16, 16] from k_tile[tile_n*16 : tile_n*16+16, k*16 : k*16+16]
-            load_matrix_sync(frag_k,
-                reinterpret_cast<const __nv_bfloat16*>(&k_tile[tile_n * 16][k * 16]),
-                SharedMemoryLayout::K_TILE_COLS);
-
-            // C += A @ B^T
-            mma_sync(frag_c, frag_q, frag_k, frag_c);
-        }
-
-        // Store back to accumulator
-        #pragma unroll
-        for (int i = 0; i < frag_c.num_elements; i++) {
-            qk_accum[tile_m][tile_n][lane_id * frag_c.num_elements / 32 + i % (frag_c.num_elements / 32)] = frag_c.x[i];
-        }
+    for (int i = 0; i < 2; ++i) {
+        const int vec  = threadIdx.x + i * NUM_THREADS;    // 0..511 (8 x 16B vectors per row)
+        const int row  = vec >> 3;
+        const int col8 = vec & 7;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (row < num_valid_rows)
+            v = *(const uint4*)(q_row_base + (int64_t)row * q_row_stride + 512 + col8 * 8);
+        *(uint4*)(&sm.sPQ[row * 64 + col8 * 8]) = v;
     }
 }
 
-// Online softmax with masking for invalid tokens
-__device__ __forceinline__
-void online_softmax(
-    float qk_accum[BLOCK_M / 16][TOPK_BLOCK_SIZE / 16][16 * 16 / 32],
-    bf16 s_out[BLOCK_M][TOPK_BLOCK_SIZE],
-    float* __restrict__ row_max,
-    float* __restrict__ row_sum,
-    const bool* __restrict__ is_valid,
-    float sm_scale,
-    int warp_id,
-    int lane_id
-) {
-    // Each warp handles its assigned rows
-    const int rows_per_warp = BLOCK_M / NUM_WARPS;
-    const int row_start = warp_id * rows_per_warp;
-
-    #pragma unroll
-    for (int r = 0; r < rows_per_warp; r++) {
-        int row = row_start + r;
-
-        // Gather QK values for this row from accumulators
-        float qk_row[TOPK_BLOCK_SIZE];
-
-        #pragma unroll
-        for (int c = 0; c < TOPK_BLOCK_SIZE; c++) {
-            int tile_m = row / 16;
-            int tile_n = c / 16;
-            int local_r = row % 16;
-            int local_c = c % 16;
-
-            // Read from accumulator (simplified - actual layout depends on WMMA)
-            float val = 0.0f;  // Placeholder - need proper WMMA result extraction
-
-            // Apply mask for invalid tokens
-            if (!is_valid[c]) {
-                val = -INFINITY;
-            }
-
-            qk_row[c] = val * sm_scale;
-        }
-
-        // Find max
-        float max_val = row_max[row];
-        #pragma unroll
-        for (int c = 0; c < TOPK_BLOCK_SIZE; c++) {
-            max_val = fmaxf(max_val, qk_row[c]);
-        }
-
-        // Rescale old sum and compute new exp values
-        float scale_old = expf(row_max[row] - max_val);
-        row_sum[row] *= scale_old;
-        row_max[row] = max_val;
-
-        float sum_val = 0.0f;
-        #pragma unroll
-        for (int c = 0; c < TOPK_BLOCK_SIZE; c++) {
-            float exp_val = expf(qk_row[c] - max_val);
-            s_out[row][c] = bf16(exp_val);
-            sum_val += exp_val;
-        }
-
-        row_sum[row] += sum_val;
-    }
-}
-
-// WMMA-based S @ V computation
-// v_tile_idx: which 64-column V tile we're processing (0-7 for HEAD_DIM_V=512)
-__device__ __forceinline__
-void wmma_sv_tile(
-    const bf16 s_mat[BLOCK_M][TOPK_BLOCK_SIZE],
-    const bf16 v_tile[TOPK_BLOCK_SIZE][SharedMemoryLayout::V_TILE_COLS],
-    float o_accum[BLOCK_M / 16][HEAD_DIM_V / 16][16 * 16 / 32],
-    int v_tile_idx,  // Which V tile (0-7)
-    int warp_id,
-    int lane_id,
-    float scale  // Rescaling factor for online softmax
-) {
-    const int tiles_m = BLOCK_M / 16;  // 4
-    const int tiles_n_per_v_tile = SharedMemoryLayout::V_TILE_COLS / 16;  // 4
-    const int total_tiles = tiles_m * tiles_n_per_v_tile;  // 16
-    const int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;
-
-    // Offset into o_accum for this V tile
-    const int o_tile_n_offset = v_tile_idx * tiles_n_per_v_tile;
-
-    #pragma unroll
-    for (int t = 0; t < tiles_per_warp; t++) {
-        int tile_idx = warp_id * tiles_per_warp + t;
-        if (tile_idx >= total_tiles) break;
-
-        int tile_m = tile_idx / tiles_n_per_v_tile;
-        int tile_n = tile_idx % tiles_n_per_v_tile;
-        int o_tile_n = o_tile_n_offset + tile_n;  // Global tile index in output
-
-        FragA_PV frag_s;
-        FragB_PV frag_v;
-        FragC_PV frag_c;
-
-        // Load existing accumulator and rescale
-        #pragma unroll
-        for (int i = 0; i < frag_c.num_elements; i++) {
-            frag_c.x[i] = o_accum[tile_m][o_tile_n][lane_id * frag_c.num_elements / 32 + i % (frag_c.num_elements / 32)] * scale;
-        }
-
-        // Accumulate S @ V over K dimension (64 elements)
-        const int k_tiles = TOPK_BLOCK_SIZE / 16;  // 4
-        #pragma unroll
-        for (int k = 0; k < k_tiles; k++) {
-            load_matrix_sync(frag_s,
-                reinterpret_cast<const __nv_bfloat16*>(&s_mat[tile_m * 16][k * 16]),
-                TOPK_BLOCK_SIZE);
-
-            load_matrix_sync(frag_v,
-                reinterpret_cast<const __nv_bfloat16*>(&v_tile[k * 16][tile_n * 16]),
-                SharedMemoryLayout::V_TILE_COLS);
-
-            mma_sync(frag_c, frag_s, frag_v, frag_c);
-        }
-
-        // Store back
-        #pragma unroll
-        for (int i = 0; i < frag_c.num_elements; i++) {
-            o_accum[tile_m][o_tile_n][lane_id * frag_c.num_elements / 32 + i % (frag_c.num_elements / 32)] = frag_c.x[i];
-        }
-    }
-}
-
+//==============================================================================
 // Main kernel
+//==============================================================================
 __global__ void __launch_bounds__(NUM_THREADS, 1)
-sparse_fp8_decode_kernel(SparseFP8DecodeParams params) {
-    // Block indices
-    const int batch_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y;
-    const int head_block_idx = blockIdx.z;
+sparse_fp8_decode_kernel(const SparseFP8DecodeParams params) {
+    extern __shared__ char smem_raw[];
+    SharedMemoryPlan& sm = *reinterpret_cast<SharedMemoryPlan*>(smem_raw);
 
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
+    const int tid         = threadIdx.x;
+    const int warp_idx    = tid / 32;
+    const int m_block_idx = blockIdx.x;
+    const int s_q_idx     = blockIdx.y;
+    const int batch_idx   = blockIdx.z;
 
-    // Shared memory
-    extern __shared__ char smem_buf[];
-    SharedMemoryPlan& smem = *reinterpret_cast<SharedMemoryPlan*>(smem_buf);
+    const int head_start     = m_block_idx * BLOCK_M;                              // in [0, q_head_per_hk)
+    const int num_valid_rows = min(params.q_head_per_hk - head_start, BLOCK_M);    // ragged head tail
+    // Folded (s_q, head) axis is position-major, head-minor: row = s*q_head_per_hk + h_local.
+    const int row0           = s_q_idx * params.q_head_per_hk + head_start;
 
-    // Initialize row_max and row_sum
-    if (threadIdx.x < BLOCK_M) {
-        smem.row_max[threadIdx.x] = -INFINITY;
-        smem.row_sum[threadIdx.x] = 0.0f;
-    }
-    __syncthreads();
+    const __nv_bfloat16* q_row_base = (const __nv_bfloat16*)params.q_ptr
+        + (int64_t)batch_idx * params.q_batch_stride
+        + (int64_t)row0      * params.q_row_stride;
+    __nv_bfloat16* o_row_base = (__nv_bfloat16*)params.o_ptr
+        + (int64_t)batch_idx * params.o_batch_stride
+        + (int64_t)row0      * params.o_row_stride;
+    float* lse_base = params.softmax_lse_ptr
+        + (int64_t)batch_idx * params.q_seq_per_hk
+        + (int64_t)row0;                                            // h_kv == 1 (host-enforced)
+    const int* idx_row = params.indices_ptr
+        + (int64_t)batch_idx * params.indices_batch_stride
+        + (int64_t)s_q_idx   * params.indices_seq_stride;
+    const uint8_t* kv_base = (const uint8_t*)params.kv_ptr;
 
-    // Calculate head indices for this block
-    const int head_start = head_block_idx * BLOCK_M;
-    const int num_heads = min(BLOCK_M, params.h_q - head_start);
-
-    // Get Q pointer for this batch/seq/head_block
-    const bf16* q_ptr = params.q_ptr +
-        batch_idx * params.q_batch_stride +
-        seq_idx * params.q_seq_stride +
-        head_start * params.q_head_stride;
-
-    // Get indices pointer
-    const int* indices_ptr = params.indices_ptr +
-        batch_idx * params.indices_batch_stride +
-        seq_idx * params.indices_seq_stride;  // h_kv is typically 1 for MLA
-
-    // Get block table for this batch
-    const int* block_table = params.block_table_ptr + batch_idx * (params.topk / params.page_size + 1);
-
-    // Per-thread output accumulator (stored in registers)
-    float o_accum[BLOCK_M / 16][HEAD_DIM_V / 16][16 * 16 / 32];
+    //--------------------------------------------------------------------------
+    // Prologue: resident Q nope half [64][512], softmax state, O accumulator
+    //--------------------------------------------------------------------------
     #pragma unroll
-    for (int i = 0; i < BLOCK_M / 16; i++)
-        for (int j = 0; j < HEAD_DIM_V / 16; j++)
-            for (int k = 0; k < 16 * 16 / 32; k++)
-                o_accum[i][j][k] = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        const int vec  = tid + i * NUM_THREADS;    // 0..4095 (64 x 16B vectors per row)
+        const int row  = vec >> 6;
+        const int col8 = vec & 63;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (row < num_valid_rows)
+            v = *(const uint4*)(q_row_base + (int64_t)row * params.q_row_stride + col8 * 8);
+        *(uint4*)(&sm.sQ[row * 512 + col8 * 8]) = v;   // rows >= num_valid_rows -> hard zero
+    }
+    if (tid < BLOCK_M) { sm.sM[tid] = MAX_INIT_VAL; sm.sL[tid] = 0.0f; }
 
-    // Per-thread QK accumulator
-    float qk_accum[BLOCK_M / 16][TOPK_BLOCK_SIZE / 16][16 * 16 / 32];
+    // rO[v*16+j] <-> O[row = tid/64 + 4j][col = v*64 + tid%64]; every index compile-time
+    // constant under FULL unrolling (a runtime index would spill the array to .local).
+    float rO[O_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < O_PER_THREAD; ++i) rO[i] = 0.0f;
+    __syncthreads();                                                            // S0
 
-    // Number of K blocks
-    const int num_k_blocks = (params.topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE;
+    const int num_topk_blocks = (params.topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE;
 
-    // Process each K block
-    for (int k_block = 0; k_block < num_k_blocks; k_block++) {
-        const int buf_idx = k_block % NUM_K_BUFS;
-        const int* block_indices = indices_ptr + k_block * TOPK_BLOCK_SIZE;
-        const int tokens_this_block = min(TOPK_BLOCK_SIZE, params.topk - k_block * TOPK_BLOCK_SIZE);
+    for (int kb = 0; kb < num_topk_blocks; ++kb) {
+        //===== Phase A: indices -> validity + token base pointers =====
+        if (tid < TOPK_BLOCK_SIZE) {
+            const int k     = kb * TOPK_BLOCK_SIZE + tid;
+            const int token = (k < params.topk) ? idx_row[k] : -1;   // ragged topk tail -> invalid
+            const bool ok   = (token >= 0);                          // decode: ONLY -1 is invalid
+            sm.sValid[tid]  = ok ? 1 : 0;
+            sm.sTokPtr[tid] = ok ? (kv_base
+                                    + (int64_t)(token >> 6) * params.kv_page_stride
+                                    + (int64_t)(token & 63) * params.kv_token_stride)
+                                 : nullptr;
+        }
+        __syncthreads();                                                        // S1
 
-        // Clear QK accumulator
+        //===== Phase B: S_raw[64h, 64t] = Q . K^T over 9 d-tiles, accumulators persistent =====
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[TILES_PER_WARP];
+            #pragma unroll
+            for (int i = 0; i < TILES_PER_WARP; ++i) wmma::fill_fragment(c_frag[i], 0.0f);
+
+            for (int dt = 0; dt < 9; ++dt) {
+                if (dt < 8) {
+                    load_nope_tile(sm, dt * 64);
+                } else {
+                    load_rope_tile(sm);
+                    load_qrope_tile(sm, q_row_base, params.q_row_stride, num_valid_rows);
+                }
+                __syncthreads();                                                // S2
+                #pragma unroll
+                for (int i = 0; i < TILES_PER_WARP; ++i) {
+                    const int t = warp_idx + i * NUM_WARPS;    // warp w owns tiles w, w+8
+                    const int m = t >> 2, n = t & 3;
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        const __nv_bfloat16* aP = (dt < 8)
+                            ? (sm.sQ  + m * 16 * 512 + dt * 64 + k4 * 16)
+                            : (sm.sPQ + m * 16 * 64  +           k4 * 16);
+                        const int aLd = (dt < 8) ? 512 : 64;
+                        wmma::load_matrix_sync(a_frag, aP, aLd);
+                        // Row-major K tile viewed as col_major B == K^T (no smem transpose).
+                        wmma::load_matrix_sync(b_frag, sm.sKV + n * 16 * 64 + k4 * 16, 64);
+                        wmma::mma_sync(c_frag[i], a_frag, b_frag, c_frag[i]);
+                    }
+                }
+                __syncthreads();                                                // S3
+            }
+            #pragma unroll
+            for (int i = 0; i < TILES_PER_WARP; ++i) {
+                const int t = warp_idx + i * NUM_WARPS;
+                const int m = t >> 2, n = t & 3;
+                wmma::store_matrix_sync(sm.sAcc + m * 16 * ACC_LD + n * 16, c_frag[i],
+                                        ACC_LD, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();                                                        // S4
+
+        //===== Phase C: online softmax, base-2 domain, 4 threads per row =====
+        {
+            const float scale2 = params.sm_scale_log2;     // sm_scale * log2(e)
+            const int r   = tid >> 2;
+            const int sub = tid & 3;
+
+            float s[16];
+            float cm = MAX_INIT_VAL;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int col = sub + 4 * j;               // (4r+sub+4j) mod 32 covers all banks
+                s[j] = sm.sValid[col] ? (sm.sAcc[r * ACC_LD + col] * scale2) : MAX_INIT_VAL;
+                cm   = fmaxf(cm, s[j]);
+            }
+            cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 1));
+            cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 2));   // 4 lanes now share the row max
+
+            const float m_old   = sm.sM[r];
+            const float m_new   = fmaxf(m_old, cm);
+            const float rescale = exp2f(m_old - m_new);    // finite - finite, never NaN
+
+            float rs = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int col = sub + 4 * j;
+                // Branch is MANDATORY: in an all-invalid block m_new == MAX_INIT_VAL and a
+                // branchless exp2f(s - m_new) would be exp2f(0) = 1 for every masked column.
+                const float p = sm.sValid[col] ? exp2f(s[j] - m_new) : 0.0f;
+                sm.sPQ[r * 64 + col] = __float2bfloat16_rn(p);
+                rs += p;
+            }
+            rs += __shfl_xor_sync(0xffffffff, rs, 1);
+            rs += __shfl_xor_sync(0xffffffff, rs, 2);
+            if (sub == 0) {
+                sm.sM[r]     = m_new;
+                sm.sL[r]     = sm.sL[r] * rescale + rs;
+                sm.sScale[r] = rescale;
+            }
+        }
+        __syncthreads();                                                        // S5
+
+        //===== Phase D: rescale the O accumulator (register-private; sScale published at S5) =====
         #pragma unroll
-        for (int i = 0; i < BLOCK_M / 16; i++)
-            for (int j = 0; j < TOPK_BLOCK_SIZE / 16; j++)
-                for (int k = 0; k < 16 * 16 / 32; k++)
-                    qk_accum[i][j][k] = 0.0f;
-
-        // Process Q @ K^T in tiles
-        for (int q_tile = 0; q_tile < SharedMemoryLayout::Q_TILES; q_tile++) {
-            // Load Q tile
-            load_q_tile(q_ptr, smem.q_tile, q_tile, HEAD_DIM_K, NUM_THREADS);
-            __syncthreads();
-
-            // Load K tile (same column range as Q)
-            load_k_tile_fp8(
-                params.kv_ptr, smem.kv.k_tile[buf_idx],
-                block_indices, smem.is_valid[buf_idx],
-                q_tile, tokens_this_block,
-                params.page_size, params.kv_token_stride,
-                block_table, NUM_THREADS
-            );
-            __syncthreads();
-
-            // Compute Q @ K^T for this tile
-            wmma_qk_tile(smem.q_tile, smem.kv.k_tile[buf_idx], qk_accum,
-                warp_id, lane_id, q_tile == 0);
-            __syncthreads();
+        for (int j = 0; j < 16; ++j) {
+            const float sc = sm.sScale[tid / 64 + 4 * j];   // warp-uniform -> smem broadcast
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) rO[v * 16 + j] *= sc;
         }
 
-        // Apply softmax with masking
-        online_softmax(qk_accum, smem.s, smem.row_max, smem.row_sum,
-            smem.is_valid[buf_idx], params.sm_scale, warp_id, lane_id);
-        __syncthreads();
-
-        // Compute S @ V in tiles
-        for (int v_tile = 0; v_tile < SharedMemoryLayout::V_TILES; v_tile++) {
-            // Load V tile
-            load_v_tile_fp8(
-                params.kv_ptr, smem.kv.v_tile,
-                block_indices, smem.is_valid[buf_idx],
-                v_tile, tokens_this_block,
-                params.page_size, params.kv_token_stride,
-                block_table, NUM_THREADS
-            );
-            __syncthreads();
-
-            // Compute S @ V
-            float rescale = 1.0f;  // Rescaling handled in online_softmax
-            wmma_sv_tile(smem.s, smem.kv.v_tile, o_accum, v_tile, warp_id, lane_id, rescale);
-            __syncthreads();
+        //===== Phase E: O += P . V over 8 V column tiles (V = first 512 of the same rows) =====
+        // FULL unroll is REQUIRED: rO[v*16+j] must be a compile-time index in every loop that
+        // touches it, or ptxas allocates rO[128] on the stack (measured: 512 B local frame
+        // before this pragma). Design KEY FACT 7. Syncs inside the unrolled bodies are legal.
+        #pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            load_nope_tile(sm, v * 64);
+            __syncthreads();                                                    // S6
+            {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vb;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> pc;
+                #pragma unroll
+                for (int i = 0; i < TILES_PER_WARP; ++i) {
+                    const int t = warp_idx + i * NUM_WARPS;
+                    const int m = t >> 2, n = t & 3;
+                    wmma::fill_fragment(pc, 0.0f);
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        wmma::load_matrix_sync(pa, sm.sPQ + m * 16 * 64 + k4 * 16, 64);
+                        wmma::load_matrix_sync(vb, sm.sKV + k4 * 16 * 64 + n * 16, 64);
+                        wmma::mma_sync(pc, pa, vb, pc);
+                    }
+                    wmma::store_matrix_sync(sm.sAcc + m * 16 * ACC_LD + n * 16, pc,
+                                            ACC_LD, wmma::mem_row_major);
+                }
+            }
+            __syncthreads();                                                    // S7
+            #pragma unroll
+            for (int j = 0; j < 16; ++j)
+                rO[v * 16 + j] += sm.sAcc[(tid / 64 + 4 * j) * ACC_LD + (tid & 63)];
+            __syncthreads();                                                    // S8 (WAR on sKV/sAcc)
         }
     }
 
-    // Finalize: divide by sum and convert to BF16
-    // Store output
-    bf16* o_ptr = params.o_ptr +
-        batch_idx * params.o_batch_stride +
-        seq_idx * params.o_seq_stride +
-        head_start * params.o_head_stride;
-
-    // Each thread stores its portion of the output
-    // (Simplified - actual implementation needs proper WMMA store)
-    if (threadIdx.x < BLOCK_M && threadIdx.x < num_heads) {
-        float inv_sum = 1.0f / smem.row_sum[threadIdx.x];
-        #pragma unroll 8
-        for (int d = 0; d < HEAD_DIM_V; d++) {
-            // Extract from o_accum and normalize
-            float val = 0.0f;  // Placeholder
-            o_ptr[threadIdx.x * params.o_head_stride + d] = bf16(val * inv_sum);
+    //--------------------------------------------------------------------------
+    // Epilogue: O = rO / L (lonely row -> exact 0), LSE natural log with +inf sentinel.
+    // Explicit row guard: sm90 gets tail clipping free from TMA OOB; sm120 must guard.
+    //--------------------------------------------------------------------------
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int row = tid / 64 + 4 * j;
+        if (row < num_valid_rows) {
+            const float L   = sm.sL[row];
+            const float inv = (L == 0.0f) ? 0.0f : (1.0f / L);   // L is exactly 0 or >= 1
+            __nv_bfloat16* dst = o_row_base + (int64_t)row * params.o_row_stride + (tid & 63);
+            #pragma unroll
+            for (int v = 0; v < 8; ++v)
+                dst[v * 64] = __float2bfloat16_rn(rO[v * 16 + j] * inv);
         }
     }
-
-    // Store LSE for split-KV merging
-    if (params.softmax_lse_ptr && threadIdx.x < num_heads) {
-        float* lse_ptr = params.softmax_lse_ptr +
-            batch_idx * params.h_q * params.s_q +
-            seq_idx * params.h_q +
-            head_start;
-        lse_ptr[threadIdx.x] = logf(smem.row_sum[threadIdx.x]) + smem.row_max[threadIdx.x];
+    if (tid < num_valid_rows) {
+        const float L = sm.sL[tid];
+        // NATURAL-log final sink with +INFINITY sentinel (oracle compares inf masks exactly).
+        lse_base[tid] = (L == 0.0f) ? INFINITY : (logf(L) + sm.sM[tid] / LOG2E);
     }
 }
 
-// Kernel launch wrapper
+//==============================================================================
+// Launcher
+//==============================================================================
 void run_sparse_fp8_decode_kernel(const SparseFP8DecodeParams& params) {
-    const int num_head_blocks = (params.h_q + BLOCK_M - 1) / BLOCK_M;
-
-    dim3 grid(params.batch_size, params.s_q, num_head_blocks);
-    dim3 block(NUM_THREADS);
-    size_t smem_size = sizeof(SharedMemoryPlan);
-
+    const int num_m_blocks = (params.q_head_per_hk + BLOCK_M - 1) / BLOCK_M;
+    const dim3 grid(num_m_blocks, params.s_q, params.b);
+    const dim3 block(NUM_THREADS);
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    static_assert(smem_size <= 99 * 1024, "exceeds SM120 99KB opt-in smem");
+    if (smem_size > 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(sparse_fp8_decode_kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)smem_size));
+    }
     sparse_fp8_decode_kernel<<<grid, block, smem_size, params.stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-} // namespace sparse_decode
-} // namespace sm120
+}  // namespace sparse_decode
+}  // namespace sm120

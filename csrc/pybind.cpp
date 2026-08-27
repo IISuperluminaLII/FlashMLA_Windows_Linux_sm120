@@ -366,9 +366,22 @@ DecodingAttnImplMeta get_attn_impl_meta(
     // Split-K would require: (1) writing to oaccum_ptr/softmax_lseaccum_ptr, (2) proper
     // partition index handling for batch/block assignment.
     if (arch.is_sm120()) {
-        // SM120 CUTLASS kernel supports dense BF16/FP16 (no FP8, no sparse)
+        if (is_sparse_attn) {
+            TORCH_CHECK(is_fp8_kvcache, "Sparse BF16 MLA is not supported on SM120");
+            TORCH_CHECK(h_q_.has_value(), "num_heads_q must be provided when topk is provided");
+            TORCH_CHECK(h_q_.value() % h_k == 0);
+            // num_sm_parts MUST be 1. The SM120 sparse kernel is batch-parallel and writes
+            // out/softmax_lse DIRECTLY (no oaccum). run_flash_mla_combine_kernel is launched
+            // unconditionally and is only inert while EVERY request has exactly one split
+            // (csrc/smxx/mla_combine.cu early-return), which num_sm_parts == 1 guarantees via
+            // csrc/smxx/get_mla_metadata.cu.
+            // Do NOT copy the SM100 formula: on this 188-SM device it returns 94 > MAX_SPLITS(64)
+            // -> MLA_NUM_SPLITS_SWITCH -> FLASH_ASSERT(false) -> exit(1) (a host process kill,
+            // not a Python exception).
+            return { 1, 5, 64 };
+        }
+        // SM120 CUTLASS dense path - unchanged behaviour
         TORCH_CHECK(!is_fp8_kvcache, "SM120 CUTLASS does not support FP8 KV cache.");
-        TORCH_CHECK(!is_sparse_attn, "SM120 CUTLASS does not support sparse attention.");
         // Single partition mode - kernel handles all batches sequentially
         return {
             1,   // num_sm_parts (single partition - no split-K support yet)
@@ -637,43 +650,34 @@ fwd_kvcache_mla(
             // Sparse FP8 decode path
             TORCH_CHECK(q_dtype == c10::kBFloat16, "SM120 sparse FP8 decode requires BF16 queries");
 
-            sm120::sparse_decode::SparseFP8DecodeParams sparse_params;
-            sparse_params.batch_size = batch_size;
-            sparse_params.s_q = seqlen_q_ori;
-            sparse_params.h_q = num_heads_q;
-            sparse_params.h_kv = num_heads_k;
-            sparse_params.topk = topk;
-            sparse_params.page_size = page_block_size;
-
-            sparse_params.sm_scale = softmax_scale;
-            sparse_params.sm_scale_log2 = softmax_scale * float(M_LOG2E);
-
-            sparse_params.q_ptr = (cutlass::bfloat16_t*)q.data_ptr();
-            sparse_params.kv_ptr = (cutlass::float_e4m3_t*)kcache.data_ptr();
-            sparse_params.indices_ptr = indices.value().data_ptr<int>();
-            sparse_params.block_table_ptr = block_table.data_ptr<int>();
-            sparse_params.seq_lens_ptr = seqlens_k.data_ptr<int>();
-
+            sm120::sparse_decode::SparseFP8DecodeParams sparse_params = {};
+            sparse_params.b              = batch_size;
+            sparse_params.s_q            = seqlen_q_ori;
+            sparse_params.h_q            = num_heads_q;
+            sparse_params.h_kv           = num_heads_k;
+            sparse_params.q_head_per_hk  = num_q_heads_per_hk;
+            sparse_params.q_seq_per_hk   = q_seq_per_hk;
+            sparse_params.topk           = topk;
+            sparse_params.sm_scale       = softmax_scale;
+            sparse_params.sm_scale_log2  = softmax_scale * float(M_LOG2E);
+            sparse_params.q_ptr          = q.data_ptr();
+            sparse_params.kv_ptr         = kcache.data_ptr();
+            sparse_params.indices_ptr    = indices.value().data_ptr<int>();
+            sparse_params.o_ptr          = out.data_ptr();
+            sparse_params.softmax_lse_ptr= (float*)softmax_lse.data_ptr();
             sparse_params.q_batch_stride = q.stride(0);
-            sparse_params.q_seq_stride = q.stride(1);
-            sparse_params.q_head_stride = q.stride(2);
-            sparse_params.kv_page_stride = kcache.stride(0);
-            sparse_params.kv_token_stride = kcache.stride(1);
-            sparse_params.indices_batch_stride = indices.value().stride(0);
-            sparse_params.indices_seq_stride = indices.value().stride(1);
-            sparse_params.indices_head_stride = indices.value().stride(2);
-
-            sparse_params.o_ptr = (cutlass::bfloat16_t*)out.data_ptr();
-            sparse_params.softmax_lse_ptr = (float*)softmax_lse.data_ptr();
+            // Honest name for the folded (s_q x head) axis stride of the RESHAPED q/out
+            // ([b, q_seq_per_hk, h_kv, d]); the kernel derives row0 = s_q_idx*q_head_per_hk
+            // + head_start itself. NO block_table / seq_lens: the authors' sparse decode
+            // addresses the paged cache directly from indices (page = idx/64, offs = idx%64).
+            sparse_params.q_row_stride   = q.stride(-3);
             sparse_params.o_batch_stride = out.stride(0);
-            sparse_params.o_seq_stride = out.stride(1);
-            sparse_params.o_head_stride = out.stride(2);
-
-            sparse_params.num_splits = 1;  // TODO: support split-KV
-            sparse_params.oaccum_ptr = nullptr;
-            sparse_params.lse_accum_ptr = nullptr;
-
-            sparse_params.stream = stream;
+            sparse_params.o_row_stride   = out.stride(-3);
+            sparse_params.kv_page_stride = kcache.stride(0);
+            sparse_params.kv_token_stride= kcache.stride(1);
+            sparse_params.indices_batch_stride = indices.value().stride(0);
+            sparse_params.indices_seq_stride   = indices.value().stride(1);
+            sparse_params.stream         = stream;
 
             sm120::sparse_decode::run_sparse_fp8_decode_kernel(sparse_params);
         } else {
@@ -923,14 +927,21 @@ std::vector<at::Tensor> sparse_prefill_bwd(
     TORCH_CHECK(kv.stride(-1) == 1);
     TORCH_CHECK(o.stride(-1) == 1);
     TORCH_CHECK(indices.stride(-1) == 1);
+    CHECK_CONTIGUOUS(lse);  // kernel indexes lse as [s_q, h_q] row-major
+
+    // Kernel contract (grid/tile geometry): one CTA = 64 heads x 1 query position, MLA dims fixed
+    TORCH_CHECK(h_q % 64 == 0, "sparse_prefill_bwd requires h_q to be a multiple of 64, got ", h_q);
+    TORCH_CHECK(h_kv == 1, "sparse_prefill_bwd requires h_kv == 1 (MLA), got ", h_kv);
+    TORCH_CHECK(d_qk == 576 && d_v == 512, "sparse_prefill_bwd requires d_qk=576, d_v=512, got ", d_qk, "/", d_v);
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
     auto opts_f32 = opts.dtype(at::kFloat);
 
     // Allocate output gradients
-    // dq is bf16 (written once per query, no atomics needed)
-    at::Tensor dq = at::zeros({s_q, h_q, d_qk}, opts);
+    // dq is fp32: the kernel RMW-accumulates one d-tile per topk block (exclusive rows per CTA);
+    // fp32 avoids compounding bf16 rounding across topk/64 accumulations. Converted below.
+    at::Tensor dq_f32 = at::zeros({s_q, h_q, d_qk}, opts_f32);
     // dk and dv use float32 for atomic accumulation (multiple queries write to same KV)
     at::Tensor dk_f32 = at::zeros({s_kv, h_kv, d_qk}, opts_f32);
     at::Tensor dv_f32 = at::zeros({s_kv, h_kv, d_v}, opts_f32);
@@ -953,11 +964,11 @@ std::vector<at::Tensor> sparse_prefill_bwd(
         int64_stride_to_int(o.stride(0)), int64_stride_to_int(o.stride(1)),
         int64_stride_to_int(d_o.stride(0)), int64_stride_to_int(d_o.stride(1)),
 
-        (cutlass::bfloat16_t*)dq.data_ptr(),
+        (float*)dq_f32.data_ptr(),
         (float*)dk_f32.data_ptr(),
         (float*)dv_f32.data_ptr(),
 
-        int64_stride_to_int(dq.stride(0)), int64_stride_to_int(dq.stride(1)),
+        int64_stride_to_int(dq_f32.stride(0)), int64_stride_to_int(dq_f32.stride(1)),
         int64_stride_to_int(dk_f32.stride(0)), int64_stride_to_int(dk_f32.stride(1)),
         int64_stride_to_int(dv_f32.stride(0)), int64_stride_to_int(dv_f32.stride(1)),
 
@@ -966,7 +977,8 @@ std::vector<at::Tensor> sparse_prefill_bwd(
 
     sm120::run_sparse_bwd_kernel(params);
 
-    // Convert dk and dv from float32 to bf16 for output
+    // Convert accumulated fp32 gradients to bf16 for output
+    at::Tensor dq = dq_f32.to(opts.dtype());
     at::Tensor dk = dk_f32.to(opts.dtype());
     at::Tensor dv = dv_f32.to(opts.dtype());
 

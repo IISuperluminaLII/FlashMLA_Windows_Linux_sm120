@@ -377,6 +377,10 @@ def flash_mla_sparse_bwd(
     return results
 
 
+# NOTE: the fwd/bwd allocate their scratch workspace per-call via torch.empty (below). This is
+# CUDA-graph-safe under Inductor cudagraph_trees: the allocation/free is recorded in the graph's
+# memory pool and replayed deterministically (a PERSISTENT cached workspace instead BREAKS
+# cudagraph_trees with "live storage data ptrs not accounted for" -- it must be freed each call).
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -502,6 +506,83 @@ def _flash_attn_varlen_backward(
     return dq, dk, dv
 
 
+# ---------------------------------------------------------------------------------------------
+# torch.compile(fullgraph=True) compatibility: the dense_prefill_fwd/bwd kernels are pybind C++
+# extensions with no fake/meta, so Dynamo cannot trace them and errors under fullgraph. Wrap the
+# Python forward/backward as torch.library custom ops with register_fake (shape inference) +
+# register_autograd, so the kernel is an opaque-but-traceable op. flash_attn_varlen_func routes
+# through these. Eager behavior is unchanged (the op body calls the same kernel).
+# ---------------------------------------------------------------------------------------------
+@torch.library.custom_op("flash_mla::varlen_fwd", mutates_args=())
+def _varlen_fwd_op(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor, cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int, max_seqlen_kv: int,
+    causal: bool, softmax_scale: float, is_varlen: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+        causal=causal, softmax_scale=softmax_scale, is_varlen=is_varlen)
+
+
+@_varlen_fwd_op.register_fake
+def _(q, k, v, cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+      causal, softmax_scale, is_varlen):
+    qo_total_len, num_qo_heads, _ = q.shape
+    _, _, head_dim_vo = v.shape
+    out = q.new_empty((qo_total_len, num_qo_heads, head_dim_vo))
+    # lse is stored seqlen-contiguous: empty(num_heads, total).T  -> [total, num_heads]
+    lse = torch.empty((num_qo_heads, qo_total_len), device=q.device, dtype=torch.float32).transpose(0, 1)
+    return out, lse
+
+
+@torch.library.custom_op("flash_mla::varlen_bwd", mutates_args=())
+def _varlen_bwd_op(
+    do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    out: torch.Tensor, lse: torch.Tensor,
+    cu_seqlens_qo: torch.Tensor, cu_seqlens_kv: torch.Tensor,
+    max_seqlen_qo: int, max_seqlen_kv: int,
+    causal: bool, softmax_scale: float, is_varlen: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _flash_attn_varlen_backward(
+        do, q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+        causal=causal, softmax_scale=softmax_scale, is_varlen=is_varlen)
+
+
+@_varlen_bwd_op.register_fake
+def _(do, q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
+      causal, softmax_scale, is_varlen):
+    qo_total_len, num_qo_heads, head_dim_qk = q.shape
+    kv_total_len, num_kv_heads, head_dim_vo = v.shape
+    dq = q.new_empty((qo_total_len, num_qo_heads, head_dim_qk))
+    dk = q.new_empty((kv_total_len, num_kv_heads, head_dim_qk))
+    dv = q.new_empty((kv_total_len, num_kv_heads, head_dim_vo))
+    return dq, dk, dv
+
+
+def _varlen_fwd_setup_context(ctx, inputs, output):
+    q, k, v, cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv, causal, softmax_scale, is_varlen = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
+    ctx.max_seqlen_qo = max_seqlen_qo
+    ctx.max_seqlen_kv = max_seqlen_kv
+    ctx.causal = causal
+    ctx.softmax_scale = softmax_scale
+    ctx.is_varlen = is_varlen
+
+
+def _varlen_fwd_backward(ctx, grad_out, grad_lse):
+    del grad_lse  # LSE does not propagate gradients
+    q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
+    dq, dk, dv = _varlen_bwd_op(
+        grad_out.contiguous(), q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv,
+        ctx.max_seqlen_qo, ctx.max_seqlen_kv, ctx.causal, ctx.softmax_scale, ctx.is_varlen)
+    return dq, dk, dv, None, None, None, None, None, None, None
+
+
+_varlen_fwd_op.register_autograd(_varlen_fwd_backward, setup_context=_varlen_fwd_setup_context)
+
+
 class FlashAttnVarlenFunc(torch.autograd.Function):
     def forward(
         ctx,
@@ -563,10 +644,14 @@ def flash_attn_varlen_func(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
-    return FlashAttnVarlenFunc.apply(
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    # Route through the torch.library custom op (fake + autograd registered) so the C++ kernel is
+    # traceable under torch.compile(fullgraph=True). Eager result is identical to the old path.
+    return _varlen_fwd_op(
         q, k, v,
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
+        causal, float(softmax_scale), is_varlen,
     )
 
 

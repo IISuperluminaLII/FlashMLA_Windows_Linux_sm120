@@ -27,8 +27,10 @@ struct SparsePrefillBwdParams {
     int stride_do_s_q, stride_do_h_q;
 
     // Gradient outputs
-    // dq is bf16 (written once per query, no atomics needed)
-    cutlass::bfloat16_t* __restrict__ dq;     // [s_q, h_q, d_qk]
+    // dq is fp32: each CTA owns its (position, head-block) rows exclusively and RMW-accumulates
+    // one d-tile contribution per topk block; fp32 avoids compounding bf16 rounding across
+    // topk/64 accumulations. Converted to bf16 host-side after the kernel.
+    float* __restrict__ dq;                    // [s_q, h_q, d_qk] - float32 accumulate
     // dk and dv use float32 for atomic accumulation (multiple queries write to same KV)
     float* __restrict__ dk;                    // [s_kv, h_kv, d_qk] - float32 for atomics
     float* __restrict__ dv;                    // [s_kv, h_kv, d_v] - float32 for atomics

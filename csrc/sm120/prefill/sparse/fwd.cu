@@ -189,10 +189,29 @@ __device__ void wmma_gemm_pv_tiled(
 
 //==============================================================================
 // Main sparse prefill kernel
+//
+// CFG ladder (runtime-selected via FLASH_MLA_SM120_SPARSE_FWD_CFG, default 0; each level
+// stacks on the previous per audit/design-prefill-configs.md 2.0 combination rule):
+//   0  legacy: byte-identical original codegen.
+//   1  A0 (design 2.1): FULL unroll of every rO[] loop -> compile-time indices -> rO in
+//      registers (legacy `#pragma unroll 8` left runtime indices: measured 528 B local
+//      frame/thread). Measured 1.84x (9.7 -> 17.9 TFlops on authors' perf cases).
+//   2  A0+A1 (design 2.2): QK accumulator fragments PERSIST in registers across all 9
+//      d-tiles (one store_matrix_sync at the end instead of a 16 KB smem round-trip per
+//      d-tile) and ALL 8 warps issue WMMA (2 tiles each; legacy idles warps 4-7) in both
+//      the QK and PV GEMMs. Same warp->tile map as the proven sparse-decode kernel.
 //==============================================================================
-template<typename T>
+template<typename T, int CFG = 0>
 __global__ void __launch_bounds__(T::NUM_THREADS_TOTAL, 1)
 sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
+    constexpr bool FULL_UNROLL_O = CFG >= 1;
+    constexpr bool REG_ACC       = CFG >= 2;
+    // CFG>=3 (A2+A3+A4, design 2.3): warp-parallel BASE-2 softmax (4 threads/row +
+    // shuffle reductions, sm_scale*log2e folded once -- sM then holds the base-2-scaled
+    // max and the epilogue emits max_logits = sM, lse = log2f(sL) + sM), and the
+    // closed-form PV write-back (each thread's flat rO layout hits exactly one v_tile
+    // per parity: v_tile == tid/64 -> even rO indices, v_tile == 4 + tid/64 -> odd).
+    constexpr bool SCALAR_OPT    = CFG >= 3;
     using InputT = typename T::Input;
     using Plan = typename T::SharedMemoryPlan;
 
@@ -219,9 +238,16 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
 
     // Output accumulator in registers
     float rO[T::O_ELEMS_PER_THREAD];
-    #pragma unroll 8
-    for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
-        rO[i] = 0.0f;
+    if constexpr (FULL_UNROLL_O) {
+        #pragma unroll
+        for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+            rO[i] = 0.0f;
+        }
+    } else {
+        #pragma unroll 8
+        for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+            rO[i] = 0.0f;
+        }
     }
 
     // Softmax statistics (initialized per block)
@@ -261,6 +287,16 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         //======================================================================
         InputT* sQ_tile = smem.qk_phase.smem_Q_tile.data();
         InputT* sK_tiles[2] = {smem.qk_phase.smem_K_tile0.data(), smem.qk_phase.smem_K_tile1.data()};
+
+        // CFG>=2 (A1): accumulator fragments persist in registers across ALL d-tiles and
+        // ALL 8 warps issue WMMA (t = warp + i*8 -> (m,n) = (t>>2, t&3), 2 tiles/warp --
+        // the proven sparse-decode map). One store_matrix_sync at the end replaces the
+        // legacy per-d-tile 16 KB load/store round-trip of sScores. Unused (elided) at CFG<2.
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> qk_acc[2];
+        if constexpr (REG_ACC) {
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::fill_fragment(qk_acc[i], 0.0f);
+        }
 
         for (int k_tile = 0; k_tile < T::NUM_K_ITERATIONS; ++k_tile) {
             const int k_offset = k_tile * T::K_TILE_SIZE;
@@ -308,9 +344,41 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
 
             __syncthreads();
 
-            // WMMA QK computation (first 4 warps)
-            wmma_gemm_qk_sparse<InputT>(sQ_tile, sK_cur, sScores, warp_idx, lane_idx, k_tile == 0);
+            if constexpr (REG_ACC) {
+                // All 8 warps, 2 WMMA tiles each, accumulating into persistent qk_acc.
+                using WmmaInputT = typename WmmaType<InputT>::type;
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int t = warp_idx + i * 8;
+                    const int m = t >> 2, n = t & 3;
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, WmmaInputT, wmma::row_major> a_frag;
+                        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, WmmaInputT, wmma::col_major> b_frag;
+                        wmma::load_matrix_sync(a_frag,
+                            reinterpret_cast<const WmmaInputT*>(sQ_tile) + m * 16 * 64 + k4 * 16, 64);
+                        wmma::load_matrix_sync(b_frag,
+                            reinterpret_cast<const WmmaInputT*>(sK_cur) + n * 16 * 64 + k4 * 16, 64);
+                        wmma::mma_sync(qk_acc[i], a_frag, b_frag, qk_acc[i]);
+                    }
+                }
+            } else {
+                // WMMA QK computation (first 4 warps; helper self-guards warp_idx >= 4)
+                wmma_gemm_qk_sparse<InputT>(sQ_tile, sK_cur, sScores, warp_idx, lane_idx, k_tile == 0);
+            }
 
+            __syncthreads();
+        }
+
+        if constexpr (REG_ACC) {
+            // Single materialization of the full 64x64 fp32 score tile.
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int t = warp_idx + i * 8;
+                const int m = t >> 2, n = t & 3;
+                wmma::store_matrix_sync(sScores + m * 16 * T::BLOCK_SIZE_N + n * 16, qk_acc[i],
+                                        T::BLOCK_SIZE_N, wmma::mem_row_major);
+            }
             __syncthreads();
         }
 
@@ -318,6 +386,48 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         // Phase 2: Online softmax
         // Apply scale, compute max, rescale previous O, compute exp
         //======================================================================
+        if constexpr (SCALAR_OPT) {
+            // A2+A4: all 256 threads, 4 per row, BASE-2 domain (scale2 folded once).
+            // sM holds the base-2-scaled max; formulas mirror the proven decode kernel.
+            const float scale2 = params.sm_scale * LOG2E;
+            const int r   = thread_idx >> 2;
+            const int sub = thread_idx & 3;
+
+            float s2[16];
+            float cm = NEGATIVE_INFINITY;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int col = sub + 4 * j;
+                s2[j] = sIsValid[col] ? (sScores[r * T::BLOCK_SIZE_N + col] * scale2)
+                                      : NEGATIVE_INFINITY;
+                cm = fmaxf(cm, s2[j]);
+            }
+            cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 1));
+            cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 2));
+
+            const float old_max = sM[r];
+            const float new_max = fmaxf(old_max, cm);
+            const float rescale = exp2f(old_max - new_max);   // -1e30 arithmetic stays finite
+
+            float rs = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int col = sub + 4 * j;
+                const int idx = r * T::BLOCK_SIZE_N + col;
+                // Branch mandatory: all-invalid block has new_max == -1e30 and a branchless
+                // exp2f(s2 - new_max) would emit 1.0 for every masked column.
+                const float p = sIsValid[col] ? exp2f(s2[j] - new_max) : 0.0f;
+                sScores[idx] = p;
+                rs += p;
+            }
+            rs += __shfl_xor_sync(0xffffffff, rs, 1);
+            rs += __shfl_xor_sync(0xffffffff, rs, 2);
+            if (sub == 0) {
+                sM[r]     = new_max;
+                sL[r]     = sL[r] * rescale + rs;
+                sScale[r] = rescale;
+            }
+        } else
         if (thread_idx < T::BLOCK_SIZE_M) {
             // Find row max
             float row_max = NEGATIVE_INFINITY;
@@ -356,12 +466,23 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         __syncthreads();
 
         // Rescale previous output accumulator
-        #pragma unroll 8
-        for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
-            int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
-            int row = idx / T::HEAD_DIM_V;
-            if (row < T::BLOCK_SIZE_M) {
-                rO[i] *= sScale[row];
+        if constexpr (FULL_UNROLL_O) {
+            #pragma unroll
+            for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+                int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+                int row = idx / T::HEAD_DIM_V;
+                if (row < T::BLOCK_SIZE_M) {
+                    rO[i] *= sScale[row];
+                }
+            }
+        } else {
+            #pragma unroll 8
+            for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+                int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+                int row = idx / T::HEAD_DIM_V;
+                if (row < T::BLOCK_SIZE_M) {
+                    rO[i] *= sScale[row];
+                }
             }
         }
         __syncthreads();
@@ -398,8 +519,12 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
                 bool is_valid = sIsValid[row];
 
                 if (is_valid) {
-                    // V is stored after K in KV buffer: offset by d_qk
-                    sV[idx] = kv_ptr[token_idx * params.stride_kv_s_kv + params.d_qk + col];
+                    // MLA latent KV: V is the FIRST d_v elements of the 576-wide KV row
+                    // (the latent part, aliased with K's nope portion). Authors' reference:
+                    // result = attn_score @ kvs[:, :, :d_v] (test_flash_mla_prefill.py), and
+                    // sm90 fwd.cu SmemLayoutHalfV = transposed view of K tiles 0..7.
+                    // (Was `+ params.d_qk + col`: an OOB read into the NEXT token's K data.)
+                    sV[idx] = kv_ptr[token_idx * params.stride_kv_s_kv + col];
                 } else {
                     sV[idx] = InputT(0);
                 }
@@ -413,27 +538,94 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         for (int v_tile = 0; v_tile < T::NUM_V_ITERATIONS; ++v_tile) {
             const int v_col_offset = v_tile * T::K_TILE_SIZE;
 
-            // WMMA PV computation
-            wmma_gemm_pv_tiled<InputT>(sP, sV, sO_tile, warp_idx, lane_idx, v_col_offset);
+            if constexpr (REG_ACC) {
+                // All 8 warps, 2 WMMA tiles each (legacy helper idles warps 4-7).
+                using WmmaInputT = typename WmmaType<InputT>::type;
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int t = warp_idx + i * 8;
+                    const int m = t >> 2, n = t & 3;
+                    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, WmmaInputT, wmma::row_major> pa;
+                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, WmmaInputT, wmma::row_major> vb;
+                    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pc;
+                    wmma::fill_fragment(pc, 0.0f);
+                    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        wmma::load_matrix_sync(pa,
+                            reinterpret_cast<const WmmaInputT*>(sP) + m * 16 * T::BLOCK_SIZE_N + k4 * 16,
+                            T::BLOCK_SIZE_N);
+                        wmma::load_matrix_sync(vb,
+                            reinterpret_cast<const WmmaInputT*>(sV) + (k4 * 16) * T::HEAD_DIM_V + v_col_offset + n * 16,
+                            T::HEAD_DIM_V);
+                        wmma::mma_sync(pc, pa, vb, pc);
+                    }
+                    wmma::store_matrix_sync(sO_tile + m * 16 * T::K_TILE_SIZE + n * 16, pc,
+                                            T::K_TILE_SIZE, wmma::mem_row_major);
+                }
+            } else {
+                // WMMA PV computation
+                wmma_gemm_pv_tiled<InputT>(sP, sV, sO_tile, warp_idx, lane_idx, v_col_offset);
+            }
 
             __syncthreads();
 
             // Accumulate to register output
             constexpr int tile_elems = T::BLOCK_SIZE_M * T::K_TILE_SIZE;
 
-            #pragma unroll 8
-            for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
-                int global_idx = thread_idx + i * T::NUM_THREADS_TOTAL;
-                int row = global_idx / T::HEAD_DIM_V;
-                int global_col = global_idx % T::HEAD_DIM_V;
+            if constexpr (FULL_UNROLL_O) {
+                if constexpr (SCALAR_OPT) {
+                    // A3 closed-form: thread's flat rO holds (row, col) pairs with only TWO
+                    // col values -- c0 = tid (< 512 for 256 threads, even i) and c1 = tid+256
+                    // (odd i). A 64-wide v_tile window therefore matches exactly one parity:
+                    //   v_tile == tid/64      -> even indices rO[2r], col-in-tile = tid & 63
+                    //   v_tile == 4 + tid/64  -> odd  indices rO[2r+1], same col-in-tile
+                    // 64 direct adds when active, 0 otherwise (legacy scans all 128 with
+                    // guards, 7/8 wasted). Branch is warp-uniform (tid/64 constant per 2 warps).
+                    const int home = thread_idx / 64;
+                    const int cit  = thread_idx & 63;
+                    if (v_tile == home) {
+                        #pragma unroll
+                        for (int rrow = 0; rrow < T::BLOCK_SIZE_M; ++rrow) {
+                            rO[2 * rrow] += sO_tile[rrow * T::K_TILE_SIZE + cit];
+                        }
+                    } else if (v_tile == 4 + home) {
+                        #pragma unroll
+                        for (int rrow = 0; rrow < T::BLOCK_SIZE_M; ++rrow) {
+                            rO[2 * rrow + 1] += sO_tile[rrow * T::K_TILE_SIZE + cit];
+                        }
+                    }
+                } else {
+                #pragma unroll
+                for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+                    int global_idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+                    int row = global_idx / T::HEAD_DIM_V;
+                    int global_col = global_idx % T::HEAD_DIM_V;
 
-                // Check if this column is in current tile
-                if (global_col >= v_col_offset && global_col < v_col_offset + T::K_TILE_SIZE) {
-                    int col_in_tile = global_col - v_col_offset;
-                    int tile_idx = row * T::K_TILE_SIZE + col_in_tile;
+                    if (global_col >= v_col_offset && global_col < v_col_offset + T::K_TILE_SIZE) {
+                        int col_in_tile = global_col - v_col_offset;
+                        int tile_idx = row * T::K_TILE_SIZE + col_in_tile;
 
-                    if (row < T::BLOCK_SIZE_M && tile_idx < tile_elems) {
-                        rO[i] += sO_tile[tile_idx];
+                        if (row < T::BLOCK_SIZE_M && tile_idx < tile_elems) {
+                            rO[i] += sO_tile[tile_idx];
+                        }
+                    }
+                }
+                }
+            } else {
+                #pragma unroll 8
+                for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+                    int global_idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+                    int row = global_idx / T::HEAD_DIM_V;
+                    int global_col = global_idx % T::HEAD_DIM_V;
+
+                    // Check if this column is in current tile
+                    if (global_col >= v_col_offset && global_col < v_col_offset + T::K_TILE_SIZE) {
+                        int col_in_tile = global_col - v_col_offset;
+                        int tile_idx = row * T::K_TILE_SIZE + col_in_tile;
+
+                        if (row < T::BLOCK_SIZE_M && tile_idx < tile_elems) {
+                            rO[i] += sO_tile[tile_idx];
+                        }
                     }
                 }
             }
@@ -446,15 +638,29 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
     //==========================================================================
     __syncthreads();
 
-    #pragma unroll 8
-    for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
-        int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
-        int row = idx / T::HEAD_DIM_V;
-        int col = idx % T::HEAD_DIM_V;
+    if constexpr (FULL_UNROLL_O) {
+        #pragma unroll
+        for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+            int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+            int row = idx / T::HEAD_DIM_V;
+            int col = idx % T::HEAD_DIM_V;
 
-        if (row < T::BLOCK_SIZE_M && col < params.d_v) {
-            float inv_sum = 1.0f / (sL[row] + 1e-6f);
-            out_ptr[row * params.d_v + col] = InputT(rO[i] * inv_sum);
+            if (row < T::BLOCK_SIZE_M && col < params.d_v) {
+                float inv_sum = 1.0f / (sL[row] + 1e-6f);
+                out_ptr[row * params.d_v + col] = InputT(rO[i] * inv_sum);
+            }
+        }
+    } else {
+        #pragma unroll 8
+        for (int i = 0; i < T::O_ELEMS_PER_THREAD; ++i) {
+            int idx = thread_idx + i * T::NUM_THREADS_TOTAL;
+            int row = idx / T::HEAD_DIM_V;
+            int col = idx % T::HEAD_DIM_V;
+
+            if (row < T::BLOCK_SIZE_M && col < params.d_v) {
+                float inv_sum = 1.0f / (sL[row] + 1e-6f);
+                out_ptr[row * params.d_v + col] = InputT(rO[i] * inv_sum);
+            }
         }
     }
 
@@ -464,8 +670,18 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         int out_idx = s_q_idx * params.h_q + global_h_idx;
 
         if (global_h_idx < params.h_q) {
-            params.max_logits[out_idx] = sM[thread_idx] / params.sm_scale;  // Un-scaled max
-            params.lse[out_idx] = log2f(sL[thread_idx]) + sM[thread_idx] * LOG2E;  // 2-based LSE
+            if constexpr (SCALAR_OPT) {
+                // Base-2 softmax (A4): sM ALREADY holds max(S * sm_scale * log2e).
+                params.max_logits[out_idx] = sM[thread_idx];
+                params.lse[out_idx] = log2f(sL[thread_idx]) + sM[thread_idx];  // 2-based LSE
+            } else {
+                // Authors' convention (test_flash_mla_prefill.py reference_torch): max_logits is
+                // the max of scores AFTER `attn_score *= sm_scale * log2(e)`. sM holds
+                // max(S*sm_scale) in natural units, so max_logits = sM * LOG2E. (Was
+                // sM / sm_scale = raw unscaled max — the 15.635 rel-err fingerprint.)
+                params.max_logits[out_idx] = sM[thread_idx] * LOG2E;
+                params.lse[out_idx] = log2f(sL[thread_idx]) + sM[thread_idx] * LOG2E;  // 2-based LSE
+            }
         }
     }
 }
@@ -490,16 +706,29 @@ void run_sparse_fwd_kernel(const SparsePrefillParams& params) {
     using Traits = sparse_prefill::TraitsBF16;
     const size_t smem_size = Traits::SMEM_SIZE;
 
-    // Set max dynamic shared memory if needed
-    if (smem_size > 48 * 1024) {
-        cudaFuncSetAttribute(
-            sparse_prefill_fwd_kernel<Traits>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size
-        );
-    }
+    // Runtime config selection (build once, A/B at runtime; default 0 = byte-identical
+    // legacy codegen). FLASH_MLA_SM120_SPARSE_FWD_CFG:
+    //   0 (default) legacy; 1 = A0 register-rO; 2 = +A1 persistent QK frags + 8-warp WMMA;
+    //   3 = +A2/A3/A4 parallel base-2 softmax + closed-form PV write-back.
+    static const int fwd_cfg = []() {
+        const char* e = getenv("FLASH_MLA_SM120_SPARSE_FWD_CFG");
+        int v = e ? atoi(e) : 0;
+        return (v < 0 || v > 3) ? 0 : v;
+    }();
 
-    sparse_prefill_fwd_kernel<Traits><<<grid, block, smem_size, params.stream>>>(params);
+    auto launch = [&](auto kernel_fn) {
+        if (smem_size > 48 * 1024) {
+            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        }
+        kernel_fn<<<grid, block, smem_size, params.stream>>>(params);
+    };
+
+    switch (fwd_cfg) {
+        case 3:  launch(sparse_prefill_fwd_kernel<Traits, 3>); break;
+        case 2:  launch(sparse_prefill_fwd_kernel<Traits, 2>); break;
+        case 1:  launch(sparse_prefill_fwd_kernel<Traits, 1>); break;
+        default: launch(sparse_prefill_fwd_kernel<Traits, 0>); break;
+    }
 }
 
 } // namespace sm120

@@ -279,8 +279,15 @@ ext_modules = [
             this_dir / "csrc" / "sm90",
             this_dir / "csrc" / "cutlass" / "include",
             this_dir / "csrc" / "cutlass" / "tools" / "util" / "include",
-            
-        ],
+        ]
+        # CUDA 13.x relocated the CCCL headers (cuda/std/*, cub, thrust) from
+        # ${CUDA_HOME}/include into ${CUDA_HOME}/include/cccl. nvcc adds that path
+        # automatically but the g++ HOST compile of pybind.cpp (which includes CUTLASS ->
+        # <cuda/std/utility>) does not, so add it explicitly. Existence-gated: absent on
+        # CUDA 12.x, so 12.x builds are byte-identical.
+        + ([Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "include" / "cccl"]
+           if (Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "include" / "cccl").is_dir()
+           else []),
     )
 ]
 

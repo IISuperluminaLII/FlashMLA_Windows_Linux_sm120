@@ -173,14 +173,18 @@ __device__ __forceinline__ void fwd_qk(FwdSmem<DQK, DVO>& smem, int m_size, int 
 // Updates m_i, l_i, writes P (bf16), and rescales acc[m, :] *= corr in place.
 template <int DQK, int DVO>
 __device__ __forceinline__ void fwd_online_softmax(
-    FwdSmem<DQK, DVO>& smem, int m_size, int n_size, bool is_causal, int m_start_g, int n_start_g) {
+    FwdSmem<DQK, DVO>& smem, int m_size, int n_size, bool is_causal, int m_start_g, int n_start_g,
+    int causal_off) {
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     for (int m = warp_id; m < m_size; m += FWD_NUM_WARPS) {
         // each lane owns key column n = lane (BN=32)
         float s = -INFINITY;
         if (lane < n_size) {
-            bool masked = is_causal && ((m_start_g + m) < (n_start_g + lane));
+            // Bottom-right causal alignment: query causal pos = (m_start_g + m) + causal_off,
+            // with causal_off = seq_kv - seq_q. =0 for square (prefill/training); for a single
+            // decode query (seq_q=1) it lets that query attend to all cached keys.
+            bool masked = is_causal && ((m_start_g + m + causal_off) < (n_start_g + lane));
             if (!masked) s = smem.s()[m * FWD_BN + lane];
         }
         // row max
@@ -285,11 +289,12 @@ fmha_fwd_sm120_mla_kernel(
     fwd_load_rows(smem.q(), q, q_start, m_start, m_size, num_heads, head_idx, DQK);
     __syncthreads();
 
-    // causal: only K-tiles up to this Q-tile's last row matter (top-left)
+    // causal: only K-tiles up to this Q-tile's last row matter (bottom-right aligned)
     int n_block_max = (seq_kv + FWD_BN - 1) / FWD_BN;
     if (kIsCausal) {
-        int last_q = m_start + m_size - 1;       // global query index (top-left aligned)
-        n_block_max = min(n_block_max, (last_q + 1 + FWD_BN - 1) / FWD_BN);
+        int last_q = m_start + m_size - 1;          // global query index
+        int last_key = last_q + (seq_kv - seq_q);   // bottom-right: furthest visible key (=last_q if square)
+        n_block_max = min(n_block_max, (last_key + 1 + FWD_BN - 1) / FWD_BN);
     }
 
     // cp.async double-buffered K/V pipeline: prefetch block n+1 while computing block n.
@@ -321,7 +326,7 @@ fmha_fwd_sm120_mla_kernel(
         smem.set_buffer(cur);
 
         fwd_qk<DQK, DVO>(smem, m_size, n_size, scale);
-        fwd_online_softmax<DQK, DVO>(smem, m_size, n_size, kIsCausal, m_start, n_start);
+        fwd_online_softmax<DQK, DVO>(smem, m_size, n_size, kIsCausal, m_start, n_start, seq_kv - seq_q);
         fwd_pv<DQK, DVO>(smem, m_size, n_size);
         __syncthreads();  // compute done; buffer `cur` is free for a future prefetch
 

@@ -158,8 +158,12 @@ fmha_fwd_mma_kernel(
 
     int nb_max = (skv + FM_BKV - 1) / FM_BKV;
     if (kCausal) {
+        // Bottom-right causal alignment (FlashAttention / KV-cache convention): a query at
+        // sequence index iq sees keys 0..iq+(skv-sq). Reduces to iq when sq==skv (prefill/
+        // training); lets a single decode query (sq=1) reach all skv cached keys.
         int last_q = qtile + min(FM_BQ, sq - qtile) - 1;
-        nb_max = min(nb_max, (last_q + 1 + FM_BKV - 1) / FM_BKV);
+        int last_key = last_q + (skv - sq);
+        nb_max = min(nb_max, (last_key + 1 + FM_BKV - 1) / FM_BKV);
     }
 
     // cp.async software pipeline: prefetch KV block 0 into stage 0, then each iteration
@@ -236,8 +240,11 @@ fmha_fwd_mma_kernel(
         }
 #endif
 
-        // causal mask + online softmax (C layout: c0,c1 row=lane/4; c2,c3 row=lane/4+8)
-        const int row_a = qtile + wrow + (lane / 4);
+        // causal mask + online softmax (C layout: c0,c1 row=lane/4; c2,c3 row=lane/4+8).
+        // Bottom-right alignment: shift query rows by (skv - sq) so "key_pos > query_pos"
+        // masks correctly when sq != skv (KV-cache decode). sq==skv -> offset 0 (identical).
+        const int causal_off = skv - sq;
+        const int row_a = qtile + wrow + (lane / 4) + causal_off;
         const int row_b = row_a + 8;
         if (kCausal) {
             #pragma unroll

@@ -59,18 +59,10 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
                       q.scalar_type() == at::ScalarType::BFloat16;
 
   if (can_use_wmma) {
-    // Compute max_seqlen_kv for grid sizing
-    int max_seqlen_kv = 0;
-    if (IsVarlen) {
-      auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
-      auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
-      for (int b = 0; b < batch_size; ++b) {
-        int seq_len = cu_kv_data[b + 1] - cu_kv_data[b];
-        if (seq_len > max_seqlen_kv) max_seqlen_kv = seq_len;
-      }
-    } else {
-      max_seqlen_kv = total_seqlen_kv / batch_size;
-    }
+    // CUDA-graph-safe max_seqlen_kv: total_seqlen_kv already carries Python's max_seqlen_kv (the
+    // per-seq max). Reading cu_seqlens on the host (device->host copy + sync) is ILLEGAL during
+    // CUDA-graph capture (max-autotune uses CUDA graphs), so use the passed value directly.
+    int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
 
     // raw mma.sync two-kernel-split backward (DEFAULT ON; opt out FLASH_MLA_SM120_BWD_MMA=0).
     // Atomic-free -> writes bf16 dq/dk/dv DIRECTLY (no fp32 scratch, no .to() copy).
@@ -159,15 +151,9 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       }();
       if (kUseMmaBwd && head_dim == 192 && v.size(-1) == 128 &&
           q.scalar_type() == at::ScalarType::BFloat16) {
-        int max_seqlen_kv = 0;
-        if (IsVarlen) {
-          auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
-          auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
-          for (int b = 0; b < batch_size; ++b)
-            max_seqlen_kv = std::max(max_seqlen_kv, cu_kv_data[b + 1] - cu_kv_data[b]);
-        } else {
-          max_seqlen_kv = total_seqlen_kv / batch_size;
-        }
+        // CUDA-graph-safe: total_seqlen_kv == Python's max_seqlen_kv; a device->host copy of
+        // cu_seqlens is illegal during CUDA-graph capture (max-autotune).
+        int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
         if (IsCausal)
           flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, true>(
               stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
@@ -186,15 +172,9 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
     }();
     if (kUseFusedMlaBwd && head_dim == 192 && v.size(-1) == 128 &&
         q.scalar_type() == at::ScalarType::BFloat16) {
-      int max_seqlen_kv = 0;
-      if (IsVarlen) {
-        auto cu_kv_cpu = cumulative_seqlen_kv.to(at::kCPU);
-        auto cu_kv_data = cu_kv_cpu.data_ptr<int>();
-        for (int b = 0; b < batch_size; ++b)
-          max_seqlen_kv = std::max(max_seqlen_kv, cu_kv_data[b + 1] - cu_kv_data[b]);
-      } else {
-        max_seqlen_kv = total_seqlen_kv / batch_size;
-      }
+      // CUDA-graph-safe: total_seqlen_kv == Python's max_seqlen_kv; a device->host copy of
+      // cu_seqlens is illegal during CUDA-graph capture (max-autotune).
+      int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
       auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
       auto dk_float = at::empty_like(dk, dk.options().dtype(at::kFloat));
       auto dv_float = at::empty_like(dv, dv.options().dtype(at::kFloat));

@@ -46,6 +46,20 @@ using mma_fwd::g2s_cp;
 using mma_fwd::cp_commit;
 using mma_fwd::cp_wait_group;
 
+// pack two fp32 -> bf16x2 register (low=a, high=b), matching the mma A-fragment packing.
+__device__ __forceinline__ uint32_t packbf(float a, float b) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+// warp 8x8 in-register transpose (sm_75+). Transposes the mma C-accumulator 8x8 fragment
+// {row=lane/4, cols (lane%4)*2,+1} into the mma A-operand 8x8 fragment -- eliminates the
+// shared-memory scatter+reload round-trip for the P^T / dS^T transposed operands.
+__device__ __forceinline__ uint32_t movmatrix_t(uint32_t a) {
+    uint32_t d;
+    asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(d) : "r"(a));
+    return d;
+}
+
 // ---- Preprocess: delta[token,head] = sum_d O*dO (over DVO) ------------------
 // FA-2 computes this ONCE in a separate pass (Algo 2 line 4); doing it inline in the main
 // kernels forced the O tile to stay resident in smem -> blocked cp.async. One warp/token.
@@ -133,8 +147,8 @@ fmha_bwd_mma_dkdv_kernel(
     __nv_bfloat16* Vs    = Ks    + BW_BN * DQK;
     __nv_bfloat16* Qbuf  = Vs    + BW_BN * DVO;     // [2][BM*DQK] cp.async double-buffer
     __nv_bfloat16* dObuf = Qbuf  + 2 * BM * DQK;    // [2][BM*DVO]
-    __nv_bfloat16* PtS   = dObuf + 2 * BM * DVO;    // O tile dropped: delta is precomputed
-    float* lseS   = reinterpret_cast<float*>(PtS + BW_BN * PT_STRIDE);
+    // O tile dropped (delta precomputed); P^T/dS^T transpose staging dropped (movmatrix).
+    float* lseS   = reinterpret_cast<float*>(dObuf + 2 * BM * DVO);
     float* deltaS = lseS + BM;
 
     bg2s(Ks, k, kv0, n_start, n_size, num_heads, h, DQK);
@@ -246,24 +260,18 @@ fmha_bwd_mma_dkdv_kernel(
             }
         }
 
-        // dV += P^T @ dO (out DVO). store P^T to PtS[key,query], A x4 nt, B=dO x2.trans.
-        #pragma unroll
-        for (int mm = 0; mm < MM; ++mm) {
-            int ra = mm * BM_M + (lane / 4), rb = ra + 8;
-            #pragma unroll
-            for (int nn = 0; nn < WNN; ++nn) {
-                int lk = kw0 + nn * BM_N + (lane % 4) * 2;
-                PtS[swz(lk,   ra, PT_STRIDE)] = __float2bfloat16(Pr[mm][nn][0]);
-                PtS[swz(lk,   rb, PT_STRIDE)] = __float2bfloat16(Pr[mm][nn][2]);
-                PtS[swz(lk+1, ra, PT_STRIDE)] = __float2bfloat16(Pr[mm][nn][1]);
-                PtS[swz(lk+1, rb, PT_STRIDE)] = __float2bfloat16(Pr[mm][nn][3]);
-            }
-        }
-        __syncwarp();
+        // dV += P^T @ dO (out DVO). A=P^T built IN-REGISTER via movmatrix (no smem round-trip);
+        // B=dO x2.trans. Per query k-tile kk: a0/a2 = keys 0-7 (n-tile 0), a1/a3 = keys 8-15
+        // (n-tile 1); c0c1 -> query-lo (a0/a1), c2c3 -> query-hi (a2/a3).
         {
             uint32_t Ar[MK][4];
             #pragma unroll
-            for (int kk = 0; kk < MK; ++kk) { int row=kw0+(lane%16), col=kk*BM_K+(lane/16)*8; ldm_x4(Ar[kk], cvta_shared(PtS + swz(row, col, PT_STRIDE))); }
+            for (int kk = 0; kk < MK; ++kk) {
+                Ar[kk][0] = movmatrix_t(packbf(Pr[kk][0][0], Pr[kk][0][1]));
+                Ar[kk][1] = movmatrix_t(packbf(Pr[kk][1][0], Pr[kk][1][1]));
+                Ar[kk][2] = movmatrix_t(packbf(Pr[kk][0][2], Pr[kk][0][3]));
+                Ar[kk][3] = movmatrix_t(packbf(Pr[kk][1][2], Pr[kk][1][3]));
+            }
             #pragma unroll
             for (int dd = 0; dd < DNV; ++dd) for (int kk = 0; kk < MK; ++kk) {
                 uint32_t Br[2]; int vrow=kk*BM_K+(lane%16), vcol=dd*BM_N+(lane/16)*8;
@@ -271,26 +279,16 @@ fmha_bwd_mma_dkdv_kernel(
                 mma_16x8x16(dVr[dd], Ar[kk], Br, dVr[dd]);
             }
         }
-        __syncwarp();
-
-        // dK += dS^T @ Q (out DQK). store dS^T to PtS[key,query], A x4 nt, B=Q x2.trans.
-        #pragma unroll
-        for (int mm = 0; mm < MM; ++mm) {
-            int ra = mm * BM_M + (lane / 4), rb = ra + 8;
-            #pragma unroll
-            for (int nn = 0; nn < WNN; ++nn) {
-                int lk = kw0 + nn * BM_N + (lane % 4) * 2;
-                PtS[swz(lk,   ra, PT_STRIDE)] = __float2bfloat16(dSr[mm][nn][0]);
-                PtS[swz(lk,   rb, PT_STRIDE)] = __float2bfloat16(dSr[mm][nn][2]);
-                PtS[swz(lk+1, ra, PT_STRIDE)] = __float2bfloat16(dSr[mm][nn][1]);
-                PtS[swz(lk+1, rb, PT_STRIDE)] = __float2bfloat16(dSr[mm][nn][3]);
-            }
-        }
-        __syncwarp();
+        // dK += dS^T @ Q (out DQK). A=dS^T via movmatrix; B=Q x2.trans.
         {
             uint32_t Ar[MK][4];
             #pragma unroll
-            for (int kk = 0; kk < MK; ++kk) { int row=kw0+(lane%16), col=kk*BM_K+(lane/16)*8; ldm_x4(Ar[kk], cvta_shared(PtS + swz(row, col, PT_STRIDE))); }
+            for (int kk = 0; kk < MK; ++kk) {
+                Ar[kk][0] = movmatrix_t(packbf(dSr[kk][0][0], dSr[kk][0][1]));
+                Ar[kk][1] = movmatrix_t(packbf(dSr[kk][1][0], dSr[kk][1][1]));
+                Ar[kk][2] = movmatrix_t(packbf(dSr[kk][0][2], dSr[kk][0][3]));
+                Ar[kk][3] = movmatrix_t(packbf(dSr[kk][1][2], dSr[kk][1][3]));
+            }
             #pragma unroll
             for (int dd = 0; dd < DNQ; ++dd) for (int kk = 0; kk < MK; ++kk) {
                 uint32_t Br[2]; int qrow=kk*BM_K+(lane%16), qcol=dd*BM_N+(lane/16)*8;
@@ -353,11 +351,10 @@ fmha_bwd_mma_dq_kernel(
 
     extern __shared__ char smem_raw[];
     __nv_bfloat16* Qs    = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* dOs   = Qs    + BM * DQK;        // O tile dropped: delta is precomputed
-    __nv_bfloat16* Kbuf  = dOs   + BM * DVO;        // [2][BNB*DQK] cp.async double-buffer
-    __nv_bfloat16* Vbuf  = Kbuf  + 2 * BNB * DQK;   // [2][BNB*DVO]
-    __nv_bfloat16* DsS   = Vbuf  + 2 * BNB * DVO;
-    float* lseS   = reinterpret_cast<float*>(DsS + BM * DS_STRIDE);
+    __nv_bfloat16* dOs   = Qs    + BM * DQK;        // O tile dropped (delta precomputed);
+    __nv_bfloat16* Kbuf  = dOs   + BM * DVO;        // dS staging dropped (direct C-layout pack)
+    __nv_bfloat16* Vbuf  = Kbuf  + 2 * BNB * DQK;   // [2][BNB*DQK],[2][BNB*DVO] cp.async
+    float* lseS   = reinterpret_cast<float*>(Vbuf + 2 * BNB * DVO);
     float* deltaS = lseS + BM;
 
     bg2s(Qs,  q,   q0, m_start, m_size, num_heads, h, DQK);
@@ -435,7 +432,8 @@ fmha_bwd_mma_dq_kernel(
             for (int nn = 0; nn < NN; ++nn) mma_16x8x16(dPr[nn], dOrq[d], Vd[nn], dPr[nn]);
         }
 
-        // dS = P*(dP - delta)*scale ; store natural into DsS[query, key].
+        // dS = P*(dP - delta)*scale -> kept IN REGISTERS (no DsS smem round-trip).
+        float dSr[NN][4];
         #pragma unroll
         for (int nn = 0; nn < NN; ++nn) {
             int c0 = nn * BM_N + (lane % 4) * 2, gca = c0, gcb = c0 + 1;
@@ -444,17 +442,21 @@ fmha_bwd_mma_dq_kernel(
             bool va0=(gca<n_size)&&(!kCausal||(n_start+gca)<=(m_start+qa)), va1=(gcb<n_size)&&(!kCausal||(n_start+gcb)<=(m_start+qa));
             bool vb0=(gca<n_size)&&(!kCausal||(n_start+gca)<=(m_start+qb)), vb1=(gcb<n_size)&&(!kCausal||(n_start+gcb)<=(m_start+qb));
             p0=(va0&&qa<m_size)?p0:0.f; p1=(va1&&qa<m_size)?p1:0.f; p2=(vb0&&qb<m_size)?p2:0.f; p3=(vb1&&qb<m_size)?p3:0.f;
-            DsS[swz(qa, c0,   DS_STRIDE)] = __float2bfloat16(p0 * (dPr[nn][0] - da) * scale);
-            DsS[swz(qa, c0+1, DS_STRIDE)] = __float2bfloat16(p1 * (dPr[nn][1] - da) * scale);
-            DsS[swz(qb, c0,   DS_STRIDE)] = __float2bfloat16(p2 * (dPr[nn][2] - db) * scale);
-            DsS[swz(qb, c0+1, DS_STRIDE)] = __float2bfloat16(p3 * (dPr[nn][3] - db) * scale);
+            dSr[nn][0]=p0*(dPr[nn][0]-da)*scale; dSr[nn][1]=p1*(dPr[nn][1]-da)*scale;
+            dSr[nn][2]=p2*(dPr[nn][2]-db)*scale; dSr[nn][3]=p3*(dPr[nn][3]-db)*scale;
         }
-        __syncwarp();
 
-        // dQ += dS @ K (out DQK). A=dS x4 nt (key contiguous) ; B=K x2.trans.
+        // dQ += dS @ K (out DQK). A=dS packed DIRECTLY from the mma C-layout (dS is the
+        // un-transposed operand here): k-tile kk = key n-tiles 2kk,2kk+1; a0/a1=keys 0-7
+        // (query lo/hi), a2/a3=keys 8-15. B=K x2.trans.
         uint32_t dSar[NK][4];
         #pragma unroll
-        for (int kk = 0; kk < NK; ++kk) { int row=qw0+(lane%16), col=kk*BM_K+(lane/16)*8; ldm_x4(dSar[kk], cvta_shared(DsS + swz(row, col, DS_STRIDE))); }
+        for (int kk = 0; kk < NK; ++kk) {
+            dSar[kk][0] = packbf(dSr[2*kk][0],   dSr[2*kk][1]);
+            dSar[kk][1] = packbf(dSr[2*kk][2],   dSr[2*kk][3]);
+            dSar[kk][2] = packbf(dSr[2*kk+1][0], dSr[2*kk+1][1]);
+            dSar[kk][3] = packbf(dSr[2*kk+1][2], dSr[2*kk+1][3]);
+        }
         #pragma unroll
         for (int dd = 0; dd < DNQ; ++dd) for (int kk = 0; kk < NK; ++kk) {
             uint32_t Br[2]; int kr=kk*BM_K+(lane%16), kc=dd*BM_N+(lane/16)*8;
@@ -506,7 +508,7 @@ void launch_fmha_bwd_mma(const c10::cuda::CUDAStream& stream,
     {   // Kernel A: dK/dV, grid over KV blocks
         const int nblocks = (max_skv + BW_BN - 1) / BW_BN;
         dim3 grid(nblocks, num_heads, batch);
-        size_t smem = (BW_BN * DQK + BW_BN * DVO + 2 * BM * DQK + 2 * BM * DVO + BW_BN * PT_STRIDE) * sizeof(__nv_bfloat16) + (2 * BM) * sizeof(float);
+        size_t smem = (BW_BN * DQK + BW_BN * DVO + 2 * BM * DQK + 2 * BM * DVO) * sizeof(__nv_bfloat16) + (2 * BM) * sizeof(float);
         auto kern = fmha_bwd_mma_dkdv_kernel<DQK, DVO, kCausal>;
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, dp, cq, ck,
@@ -515,10 +517,9 @@ void launch_fmha_bwd_mma(const c10::cuda::CUDAStream& stream,
     {   // Kernel B: dQ, grid over Q blocks (queries warp-partitioned -> BMB=64; KV loop BNB).
         constexpr int BMB = BW_NW * BM_M;            // 64
         constexpr int BNB = 32;
-        constexpr int DSST = BNB > 64 ? BNB : 64;
         const int nblocks = (max_sq + BMB - 1) / BMB;
         dim3 grid(nblocks, num_heads, batch);
-        size_t smem = (BMB * DQK + BMB * DVO + 2 * BNB * DQK + 2 * BNB * DVO + BMB * DSST) * sizeof(__nv_bfloat16) + (2 * BMB) * sizeof(float);
+        size_t smem = (BMB * DQK + BMB * DVO + 2 * BNB * DQK + 2 * BNB * DVO) * sizeof(__nv_bfloat16) + (2 * BMB) * sizeof(float);
         auto kern = fmha_bwd_mma_dq_kernel<DQK, DVO, kCausal>;
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         kern<<<grid, dim3(BW_THREADS), smem, stream.stream()>>>(qp, kp, vp, op, dop, lp, dp, cq, ck,

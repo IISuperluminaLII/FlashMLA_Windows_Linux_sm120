@@ -292,23 +292,27 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
         // - q_batch_stride: stride for batch dimension
         // - q_row_stride: stride for q_seq_per_hk dimension (Q entries within KV group)
         // - q_head_stride: stride for num_heads_k dimension (KV head selection)
+        // 64-bit offset arithmetic: stride fields are int32 and the products can exceed
+        // INT32_MAX (e.g. the paged-KV pool at b=128, varlen s_k>=16384 reaches ~76K pages;
+        // page_id * k_batch_stride(36864) overflows at page ~58254 -> garbage reads that
+        // failed the authors' decode test at s_k>=16384 while s_k<=8192 still fit).
         const InputT* q_ptr = reinterpret_cast<const InputT*>(params.q_ptr) +
-                              batch_idx * params.q_batch_stride +
-                              m_block_idx * T::BLOCK_SIZE_M * params.q_row_stride +
-                              k_head_idx * params.q_head_stride;
+                              (int64_t)batch_idx * params.q_batch_stride +
+                              (int64_t)m_block_idx * T::BLOCK_SIZE_M * params.q_row_stride +
+                              (int64_t)k_head_idx * params.q_head_stride;
 
         const InputT* k_ptr = reinterpret_cast<const InputT*>(params.k_ptr) +
-                              k_head_idx * params.k_head_stride;
+                              (int64_t)k_head_idx * params.k_head_stride;
 
         // Output pointer: same layout as Q after reshape
         // O is [batch, q_seq_per_hk, num_heads_k, head_dim_v]
         InputT* o_ptr = reinterpret_cast<InputT*>(params.o_ptr) +
-                        batch_idx * params.o_batch_stride +
-                        m_block_idx * T::BLOCK_SIZE_M * params.o_row_stride +
-                        k_head_idx * params.o_head_stride;
+                        (int64_t)batch_idx * params.o_batch_stride +
+                        (int64_t)m_block_idx * T::BLOCK_SIZE_M * params.o_row_stride +
+                        (int64_t)k_head_idx * params.o_head_stride;
 
         float* lse_ptr = reinterpret_cast<float*>(params.softmax_lse_ptr) +
-                         (batch_idx * params.h_k + k_head_idx) * params.q_seq_per_hk +
+                         (int64_t)(batch_idx * params.h_k + k_head_idx) * params.q_seq_per_hk +
                          m_block_idx * T::BLOCK_SIZE_M;
 
         int* block_table_ptr = params.block_table + batch_idx * params.block_table_batch_stride;
@@ -319,7 +323,9 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             const int start_token_idx = block_idx * T::PAGE_BLOCK_SIZE;
             const int valid_tokens = min(seqlen_k - start_token_idx, T::PAGE_BLOCK_SIZE);
 
-            const InputT* kv_block_ptr = k_ptr + phys_block_idx * params.k_batch_stride;
+            // (int64_t) is REQUIRED: phys_block_idx * k_batch_stride overflows int32 once
+            // the page pool exceeds ~58K pages (INT32_MAX / 36864) -- see comment above.
+            const InputT* kv_block_ptr = k_ptr + (int64_t)phys_block_idx * params.k_batch_stride;
 
             // Clear score accumulator
             constexpr int score_elems = T::BLOCK_SIZE_M * T::PAGE_BLOCK_SIZE;
@@ -440,17 +446,33 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             }
             __syncthreads();
 
+            // Bottom-right-aligned causal limit, per ROW (packed rows = s_q x q_head_per_hk;
+            // row r belongs to query position r / q_head_per_hk). Query q_i of s_q may attend
+            // keys j <= seqlen_k - s_q + q_i, i.e. row_valid = row_limit - start_token_idx with
+            // row_limit = seqlen_k - s_q + 1 + q_i. The last query sees everything (matches the
+            // authors' reference mask and pybind's s_q==1 -> is_causal=false shortcut). The old
+            // kernel IGNORED is_causal entirely: query 0 of s_q=2 attended the full sequence,
+            // failing the authors' decode test (~1% of elements, concentrated at q_i=0).
+            // Non-causal path: row_valid == valid_tokens, byte-identical behavior.
+
             // Row-wise max and online softmax update
             if (thread_idx < T::BLOCK_SIZE_M) {
+                int row_valid = valid_tokens;
+                if (params.is_causal) {
+                    const int q_i = (m_block_idx * T::BLOCK_SIZE_M + thread_idx) / params.q_head_per_hk;
+                    const int row_limit = seqlen_k - params.s_q + 1 + q_i;
+                    row_valid = min(valid_tokens, max(0, row_limit - start_token_idx));
+                }
                 float row_max = NEGATIVE_INFINITY;
                 #pragma unroll
                 for (int j = 0; j < T::PAGE_BLOCK_SIZE; ++j) {
-                    if (j < valid_tokens) {
+                    if (j < row_valid) {
                         row_max = fmaxf(row_max, sScores[thread_idx * T::PAGE_BLOCK_SIZE + j]);
                     }
                 }
 
-                // Update global max with rescaling
+                // Update global max with rescaling. NOTE row_max may stay NEGATIVE_INFINITY for
+                // a fully-masked block (row_valid == 0): new_max keeps old_max and rescale = 1.
                 float old_max = sM[thread_idx];
                 float new_max = fmaxf(old_max, row_max);
                 float rescale = (old_max == NEGATIVE_INFINITY) ? 1.0f :
@@ -464,13 +486,19 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
 
             // Compute exp(score - max) and accumulate row sum
             if (thread_idx < T::BLOCK_SIZE_M) {
+                int row_valid = valid_tokens;
+                if (params.is_causal) {
+                    const int q_i = (m_block_idx * T::BLOCK_SIZE_M + thread_idx) / params.q_head_per_hk;
+                    const int row_limit = seqlen_k - params.s_q + 1 + q_i;
+                    row_valid = min(valid_tokens, max(0, row_limit - start_token_idx));
+                }
                 float row_max = sM[thread_idx];
                 float row_sum = 0.0f;
 
                 #pragma unroll
                 for (int j = 0; j < T::PAGE_BLOCK_SIZE; ++j) {
                     int idx = thread_idx * T::PAGE_BLOCK_SIZE + j;
-                    if (j < valid_tokens) {
+                    if (j < row_valid) {
                         float exp_val = exp2f((sScores[idx] - row_max) * LOG2E);
                         sScores[idx] = exp_val;
                         row_sum += exp_val;
