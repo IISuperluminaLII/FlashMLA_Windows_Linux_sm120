@@ -25,6 +25,7 @@
 #include "params.h"
 #include "traits.h"
 #include "dequant.h"
+#include "sparse_decode_cfg.h"   // shared CFG latch (also read by pybind.cpp)
 #include "../../../utils.h"
 
 #include <mma.h>
@@ -32,7 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>   // fprintf/stderr used by CHECK_CUDA from csrc/utils.h
-#include <cstdlib>  // getenv/atoi for the CFG ladder gate
+#include <cstdlib>  // exit used by CHECK_CUDA (getenv/atoi live in sparse_decode_cfg.h)
 
 namespace sm120 {
 namespace sparse_decode {
@@ -334,12 +335,29 @@ sparse_fp8_decode_kernel(const SparseFP8DecodeParams params) {
 //==============================================================================
 void run_sparse_fp8_decode_kernel(const SparseFP8DecodeParams& params) {
     // CFG ladder (FLASH_MLA_SM120_SPARSE_DECODE_CFG): 0 = legacy WMMA (default,
-    // byte-identical), 1 = raw mma.sync + ldmatrix + cp.async (splitkv_mla_mma.cuh).
-    static const int decode_cfg = [] {
-        const char* e = getenv("FLASH_MLA_SM120_SPARSE_DECODE_CFG");
-        const int v = e ? atoi(e) : 0;
-        return v < 0 ? 0 : (v > 1 ? 1 : v);
-    }();
+    // byte-identical), 1 = raw mma.sync batch-parallel (splitkv_mla_mma.cuh),
+    // 2 = mma.sync + authors' split-KV (metadata walk + partials + combine),
+    // 3 = 2 + the 2-CTA cluster DSM crossover (half-topk dequant sharing;
+    //     documented NEGATIVE on this part, opt-in for the record),
+    // 4 = the CFG=2 splitkv kernel with the split cap raised 64 -> 192
+    //     (metadata arm emits up to 188 parts; combine carries 128/192 tiers).
+    // sparse_decode_cfg() is the SAME single-instance latch pybind's metadata arm
+    // reads (sparse_decode_cfg.h): CFG>=2 makes get_attn_impl_meta emit real
+    // multi-split schedules that ONLY the splitkv tiers consume (CFG=3 with the
+    // head-block count padded to full cluster pairs); CFG<2 keeps
+    // num_sm_parts=1 so the combine stays inert and both batch-parallel tiers
+    // ignore the metadata entirely.
+    const int decode_cfg = sparse_decode_cfg();
+    if (decode_cfg == 3) {
+        mma::launch_sparse_fp8_decode_mma_splitkv_x(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
+    if (decode_cfg == 2 || decode_cfg == 4) {
+        mma::launch_sparse_fp8_decode_mma_splitkv(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
     if (decode_cfg == 1) {
         mma::launch_sparse_fp8_decode_mma(params);
         CHECK_CUDA_KERNEL_LAUNCH();

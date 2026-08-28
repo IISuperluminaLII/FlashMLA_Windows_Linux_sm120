@@ -24,3 +24,10 @@ echo "nvcc: $(command -v nvcc) ($(nvcc --version | tail -1))"
 "$PY" setup.py build_ext --inplace 2>&1 | tail -3
 echo "CU13_BUILD_DONE"
 ls -la flash_mla/*.so
+# GUARANTEE importability for script-style test runs (sys.path[0] = tests/, cwd NOT on
+# sys.path): editable-install the copy into the cu13 env, mirroring the live env setup.
+# Idempotent; --no-build-isolation reuses the objects built above. Without this the
+# battery once ran with ZERO suites able to import flash_mla while still printing DONE.
+"$PY" -m pip install -e . --no-deps --no-build-isolation -q 2>&1 | tail -2
+"$PY" -c "import flash_mla; print('IMPORT_OK:', flash_mla.__file__)"
+echo "CU13_INSTALL_DONE"

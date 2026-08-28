@@ -31,6 +31,8 @@
 #include "fwd.h"
 #include "traits.h"
 #include "params.h"
+#include <cstdio>    // fprintf/stderr used by CHECK_CUDA
+#include "../../../utils.h"   // CHECK_CUDA / CHECK_CUDA_KERNEL_LAUNCH
 #include "fwd_mma.cuh"   // CFG>=4: raw mma.sync + ldmatrix + cp.async sparse kernel (F1 tier)
 
 using namespace cute;
@@ -264,8 +266,10 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
     }
     __syncthreads();
 
-    // Number of topk blocks to process
-    const int num_topk_blocks = params.topk / T::BLOCK_SIZE_N;
+    // Number of topk blocks to process. CEIL: a ragged tail (topk % 64 != 0) is
+    // handled by the k >= topk guard below (truncation silently DROPPED the tail
+    // tokens -- caught by the ragged-topk red-green case D).
+    const int num_topk_blocks = (params.topk + T::BLOCK_SIZE_N - 1) / T::BLOCK_SIZE_N;
 
     // Process each topk block
     for (int topk_block = 0; topk_block < num_topk_blocks; ++topk_block) {
@@ -273,10 +277,11 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
         int* sIndices = smem.smem_indices.data();
         bool* sIsValid = smem.smem_is_valid.data();
 
-        // Cooperative loading of indices and validity mask
+        // Cooperative loading of indices and validity mask (ragged tail -> invalid,
+        // and never dereference indices_ptr past topk)
         if (thread_idx < T::BLOCK_SIZE_N) {
             int global_idx = topk_block * T::BLOCK_SIZE_N + thread_idx;
-            int token_idx = indices_ptr[global_idx];
+            int token_idx = (global_idx < params.topk) ? indices_ptr[global_idx] : -1;
             sIndices[thread_idx] = token_idx;
             sIsValid[thread_idx] = (token_idx >= 0 && token_idx < params.s_kv);
         }
@@ -691,9 +696,8 @@ sparse_prefill_fwd_kernel(const SparsePrefillParams params) {
 // Kernel launcher
 //==============================================================================
 void run_sparse_fwd_kernel(const SparsePrefillParams& params) {
-    // Validation
+    // Validation (ragged topk is HANDLED: ceil block count + k >= topk guard)
     CUTLASS_ASSERT(params.h_kv == 1);  // MLA requires single KV head
-    CUTLASS_ASSERT(params.topk % sparse_prefill::B_TOPK == 0);  // topk must be multiple of block size
     CUTLASS_ASSERT(params.h_q % sparse_prefill::B_H == 0);  // h_q must be multiple of block size
     CUTLASS_ASSERT(params.d_qk == sparse_prefill::D_QK);  // Fixed MLA dimensions
     CUTLASS_ASSERT(params.d_v == sparse_prefill::D_V);
@@ -721,14 +725,16 @@ void run_sparse_fwd_kernel(const SparsePrefillParams& params) {
 
     if (fwd_cfg == 4) {
         sparse_mma::launch_sparse_fwd_mma(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
         return;
     }
 
     auto launch = [&](auto kernel_fn) {
         if (smem_size > 48 * 1024) {
-            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            CHECK_CUDA(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         kernel_fn<<<grid, block, smem_size, params.stream>>>(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
     };
 
     switch (fwd_cfg) {

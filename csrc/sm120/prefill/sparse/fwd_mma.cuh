@@ -358,8 +358,8 @@ inline void launch_sparse_fwd_mma(const SparsePrefillParams& params) {
     const dim3 grid(num_h_blocks * params.s_q);
     constexpr size_t smem = sizeof(SmemPlanMma);
     static_assert(smem <= 99 * 1024, "sparse mma smem exceeds 99KB");
-    cudaFuncSetAttribute(sparse_prefill_fwd_mma_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    CHECK_CUDA(cudaFuncSetAttribute(sparse_prefill_fwd_mma_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     sparse_prefill_fwd_mma_kernel<<<grid, dim3(SM_THREADS), smem, params.stream>>>(params);
 }
 

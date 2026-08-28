@@ -14,6 +14,9 @@ RED on the current kernel is guaranteed by construction:
   case B: s_q=1, topk=64 (single block+query) -> boundary where local==global softmax;
           documents the discrimination boundary (may pass on broken code by accident)
   case C: duplicates + invalid indices -> atomic accumulation + masking semantics
+  case D: ragged topk tail (topk % 64 != 0) -> the k >= topk lanes must act invalid
+  case E: all-invalid positions (idx = -1) -> fwd lse = -inf sink + bwd !isfinite(lse)
+          guard; a missing guard produces non-finite grads and trips the isfinite assert
 
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tests/_diag_sparse_bwd_redgreen.py
 """
@@ -29,7 +32,8 @@ from flash_mla import flash_mla_sparse_fwd
 from flash_mla.flash_mla_interface import flash_mla_sparse_bwd
 
 
-def make_case(s_q, s_kv, topk, h_q=128, seed=0, invalid_frac=0.1, dup_frac=0.0):
+def make_case(s_q, s_kv, topk, h_q=128, seed=0, invalid_frac=0.1, dup_frac=0.0,
+              all_invalid_rows=()):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = (torch.randn((s_q, h_q, 576), dtype=torch.bfloat16, device="cuda", generator=g) / 10)
     kv = (torch.randn((s_kv, 1, 576), dtype=torch.bfloat16, device="cuda", generator=g) / 10)
@@ -49,6 +53,10 @@ def make_case(s_q, s_kv, topk, h_q=128, seed=0, invalid_frac=0.1, dup_frac=0.0):
             row = row.clone()
             row[inv] = s_kv + 7  # invalid sentinel (>= s_kv)
         idx[s, 0] = row.to(torch.int32)
+    # Force whole positions invalid with the NEGATIVE form (-1): exercises the
+    # forward's lse = -inf sink and the backward's !isfinite(lse) guard.
+    for s in all_invalid_rows:
+        idx[s, 0].fill_(-1)
     return q, kv, idx
 
 
@@ -65,8 +73,16 @@ def reference_grads(q, kv, idx, d_o, sm_scale):
     gathered = kvf[:, 0, :][safe.flatten()].view(s_q, topk, d_qk)      # [s_q, topk, 576]
     scores = torch.einsum("shd,std->sht", qf, gathered) * sm_scale     # [s_q, h_q, topk]
     scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
+    # All-invalid positions: softmax(all -inf) = NaN and would NaN-poison autograd.
+    # The kernel contract (fwd lse = -inf sink; bwd !isfinite(lse) guard) is out = 0
+    # and ZERO gradients for such a position. Encode that closed-form and NaN-free:
+    # give the row finite dummy scores (detached constant zero), then multiply P by a
+    # 0/1 row mask -- the mask constant zeroes both the output and every gradient
+    # path through that row, exactly the kernel semantics.
+    all_inv = invalid.all(dim=-1)                                      # [s_q]
+    scores = torch.where(all_inv.view(s_q, 1, 1), torch.zeros_like(scores), scores)
     p = torch.softmax(scores, dim=-1)
-    # all-invalid rows give NaN in autograd; none exist in our cases by construction
+    p = p * (~all_inv).view(s_q, 1, 1).float()
     out = torch.einsum("sht,std->shd", p, gathered[:, :, :d_v])
     out.backward(d_o.float())
     return qf.grad, kvf.grad                          # [s_q,h_q,576], [s_kv,1,576]
@@ -89,9 +105,12 @@ def check(name, ans, ref, cos_tol=1e-5, rel_tol=0.04):
     return ok
 
 
-def run_case(tag, s_q, s_kv, topk, seed, invalid_frac=0.1, dup_frac=0.0, must_discriminate=True):
-    print(f"[CASE {tag}] s_q={s_q} s_kv={s_kv} topk={topk} invalid={invalid_frac} dup={dup_frac}")
-    q, kv, idx = make_case(s_q, s_kv, topk, seed=seed, invalid_frac=invalid_frac, dup_frac=dup_frac)
+def run_case(tag, s_q, s_kv, topk, seed, invalid_frac=0.1, dup_frac=0.0, must_discriminate=True,
+             all_invalid_rows=()):
+    print(f"[CASE {tag}] s_q={s_q} s_kv={s_kv} topk={topk} invalid={invalid_frac} dup={dup_frac}"
+          + (f" all_invalid_rows={list(all_invalid_rows)}" if all_invalid_rows else ""))
+    q, kv, idx = make_case(s_q, s_kv, topk, seed=seed, invalid_frac=invalid_frac, dup_frac=dup_frac,
+                           all_invalid_rows=all_invalid_rows)
     sm_scale = 1.0 / math.sqrt(576)
     out, max_logits, lse = flash_mla_sparse_fwd(q, kv, idx, sm_scale)
     g = torch.Generator(device="cuda").manual_seed(seed + 1000)
@@ -118,6 +137,14 @@ if __name__ == "__main__":
     results.append(("B single block+query", run_case("B", 1, 256, 64, seed=2)))
     # C: duplicates + heavy invalid
     results.append(("C dup+invalid", run_case("C", 8, 64, 64, seed=3, invalid_frac=0.3, dup_frac=0.1)))
+    # D: RAGGED topk tail (topk % 64 != 0): the kernel's k >= topk lanes must act as
+    # invalid. A mishandled tail reads garbage indices -> cos check fails (discriminates).
+    results.append(("D ragged topk tail", run_case("D", 16, 512, 96, seed=4)))
+    # E: ALL-INVALID positions (idx = -1): fwd lse = -inf, bwd !isfinite(lse) guard must
+    # zero P/dS. If the guard were absent, P = exp2(S - (-inf)) = inf -> non-finite
+    # grads -> the isfinite assert in check() fails (discriminates by construction).
+    results.append(("E all-invalid rows", run_case("E", 8, 256, 64, seed=5,
+                                                   all_invalid_rows=(0, 3))))
 
     failed = [n for n, ok in results if not ok]
     print(f"\n[RESULT] {len(results) - len(failed)} passed, {len(failed)} failed of {len(results)}")

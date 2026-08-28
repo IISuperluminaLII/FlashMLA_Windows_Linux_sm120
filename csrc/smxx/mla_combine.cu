@@ -153,6 +153,11 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
 }
 
 
+// 128/192 tiers added for SM120 (188 SMs): the original 64 ceiling encoded
+// H800's 132 SMs (132/2 head-blocks ~ 64) and stranded 60 SMs on every
+// m_blocks<=2 sm120 schedule. MAX_SPLITS only sizes smem (8*(N+1)*4 B) and
+// ceil(N/32) lse registers per thread; all data loops are bounded by the
+// runtime my_num_splits, so the extra tiers cost nothing when unused.
 #define MLA_NUM_SPLITS_SWITCH(NUM_SPLITS, NAME, ...)       \
     [&] {                                                  \
         if (NUM_SPLITS <= 32) {                            \
@@ -160,6 +165,12 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
             return __VA_ARGS__();                          \
         } else if (NUM_SPLITS <= 64) {                     \
             constexpr static int NAME = 64;                \
+            return __VA_ARGS__();                          \
+        } else if (NUM_SPLITS <= 128) {                    \
+            constexpr static int NAME = 128;               \
+            return __VA_ARGS__();                          \
+        } else if (NUM_SPLITS <= 192) {                    \
+            constexpr static int NAME = 192;               \
             return __VA_ARGS__();                          \
         } else {                                           \
             FLASH_ASSERT(false);                           \

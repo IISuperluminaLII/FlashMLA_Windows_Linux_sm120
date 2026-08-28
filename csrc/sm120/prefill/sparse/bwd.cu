@@ -35,6 +35,12 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <type_traits>
+#include <cstdlib>   // getenv/atoi for the CFG ladder gate
+#include <cstdio>    // fprintf/stderr used by CHECK_CUDA
+#include "../../../utils.h"   // CHECK_CUDA / CHECK_CUDA_KERNEL_LAUNCH
+
+// mma.sync tier (CFG=1): raw mma.sync + ldmatrix + cp.async backward.
+#include "bwd_mma.cuh"
 
 namespace sm120 {
 namespace sparse_bwd {
@@ -350,16 +356,34 @@ sparse_prefill_bwd_kernel(const SparsePrefillBwdParams params) {
 void run_sparse_bwd_kernel(const SparsePrefillBwdParams& params) {
     using namespace sparse_bwd;
 
+    // CFG ladder (FLASH_MLA_SM120_SPARSE_BWD_CFG): 0 = legacy WMMA (default,
+    // byte-identical), 1 = raw mma.sync + ldmatrix + cp.async (bwd_mma.cuh),
+    // 2 = +vectorized dK/dV scatter via red.global.add.v2.f32 (Blackwell-class
+    //     reduction, ptxas-verified on plain sm_120 -- _probe_blackwell_reducers.sh),
+    // 3 = +lane-paired red.global.add.v4.f32 (shfl-fused 16B payloads, half the
+    //     reduction transactions of CFG=2 again).
+    static const int bwd_cfg = [] {
+        const char* e = getenv("FLASH_MLA_SM120_SPARSE_BWD_CFG");
+        const int v = e ? atoi(e) : 0;
+        return v < 0 ? 0 : (v > 3 ? 3 : v);
+    }();
+    if (bwd_cfg >= 1) {
+        sparse_bwd_mma::launch_sparse_bwd_mma(params, /*red_tier=*/bwd_cfg - 1);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
+
     const int num_h_blocks = params.h_q / B_H;
     const dim3 grid(num_h_blocks * params.s_q);
     const dim3 block(NUM_THREADS);
     const size_t smem_size = sizeof(SharedMemory);
 
     if (smem_size > 48 * 1024) {
-        cudaFuncSetAttribute(sparse_prefill_bwd_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        CHECK_CUDA(cudaFuncSetAttribute(sparse_prefill_bwd_kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     sparse_prefill_bwd_kernel<<<grid, block, smem_size, params.stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 }  // namespace sm120

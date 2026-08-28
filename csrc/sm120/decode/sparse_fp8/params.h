@@ -12,10 +12,15 @@
 //     [b, q_seq_per_hk, h_kv, d] tensor that do not mean what their names say; replaced by
 //     the honest q_row_stride/o_row_stride over the folded (s_q x head) axis.
 //   - indices_head_stride: stride(2)==1 misnomer.
-//   - num_splits / oaccum_ptr / lse_accum_ptr: re-added only with the split-KV phase.
+// Split-KV fields (CFG>=2) re-added 2026-08-27 per audit/design-sparse-splitkv.md:
+// the mma splitkv tier consumes the authors' tile-scheduler metadata and writes
+// partials the (already-unconditional) combine kernel merges. CFG<=1 kernels
+// ignore every one of these fields.
 
 #include <cuda_runtime.h>
 #include <cstdint>
+
+#include "../sched_meta.h"   // sm120::TileSchedulerMetaDataSize (shared w/ dense)
 
 namespace sm120 {
 namespace sparse_decode {
@@ -50,6 +55,13 @@ struct SparseFP8DecodeParams {
     int kv_token_stride;            // kcache.stride(1) == 656 (host-enforced)
     int indices_batch_stride;       // indices.stride(0)
     int indices_seq_stride;         // indices.stride(1)
+
+    // split-KV (CFG>=2 only; the batch-parallel tiers never read these)
+    const int* tile_scheduler_metadata_ptr;  // i32 [num_sm_parts, TileSchedulerMetaDataSize]
+    int        num_sm_parts;                 // tile_scheduler_metadata.size(0)
+    const int* num_splits_ptr;               // i32 [b+1] prefix sums (combine's skip predicate)
+    float*     softmax_lseaccum_ptr;         // f32 [b+num_sm_parts, h_kv, q_seq_per_hk], 2-BASED partials
+    float*     oaccum_ptr;                   // f32 [b+num_sm_parts, h_kv, q_seq_per_hk, 512], NORMALIZED
 
     cudaStream_t stream;
 };

@@ -165,8 +165,16 @@ blocked_k_dequant = quant.dequantize_k_cache(blocked_k_quantized)
 tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
     cache_seqlens, t.s_q * t.h_q // t.h_kv, t.h_kv, t.h_q, True, t.topk)
 
-flat_pool = blocked_k_dequant.view(-1, 576)                       # [pages*64, 576] bf16
-safe_idx = indices_in_kvcache.clamp(min=0).view(-1).long()        # invalid -> row 0
+# The oracle NaN-poisons every pool row no index references, so invalid (-1) lanes
+# must NOT gather an arbitrary row (clamp-to-0 can hit a poisoned row; the math
+# backend adds the mask's -inf AFTER QK^T, and NaN + -inf = NaN kills the whole
+# softmax row). Gather invalids from an appended all-zero sentinel row instead:
+# finite scores, then the attn_mask removes them exactly.
+flat_pool = torch.cat([blocked_k_dequant.view(-1, 576),
+                       torch.zeros(1, 576, dtype=blocked_k_dequant.dtype)], dim=0)
+zero_row = flat_pool.size(0) - 1
+safe_idx = indices_in_kvcache.long().view(-1).clone()
+safe_idx[safe_idx < 0] = zero_row
 invalid = (indices_in_kvcache < 0).view(t.b, t.s_q, 1, t.topk)
 
 
@@ -190,6 +198,13 @@ def sdpa_decode():
 
 fa = flash_decode()[0]
 sd = sdpa_decode().view(t.b, t.s_q, t.h_q, 512)
+# Rows with ZERO valid indices are softmax(all -inf) = NaN under SDPA; the kernel's
+# convention is O = 0 there (L == 0 sentinel). Align the baseline, then the finite
+# assert makes the cross-check real (a NaN on either side must fail, not print nan).
+empty_rows = invalid.view(t.b, t.s_q, 1, t.topk).all(dim=-1)      # [b, s_q, 1]
+sd = torch.where(empty_rows.unsqueeze(-1), torch.zeros_like(sd), sd)
+assert torch.isfinite(fa.float()).all(), "FlashMLA decode produced non-finite output"
+assert torch.isfinite(sd.float()).all(), "SDPA decode baseline produced non-finite output"
 cd = cosdiff(fa, sd)
 fmt(f"  decode b=128 s_q=2 topk=2048", bench_ms(flash_decode), bench_ms(sdpa_decode),
     f"(cos_diff {cd:.1e})")

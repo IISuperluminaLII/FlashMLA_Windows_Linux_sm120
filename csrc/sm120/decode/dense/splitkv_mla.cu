@@ -33,9 +33,14 @@
 #include <cutlass/arch/memory_sm80.h>
 #include <cute/tensor.hpp>
 #include <mma.h>
+#include <cstdio>    // fprintf/stderr used by CHECK_CUDA
+#include <cstdlib>   // exit used by CHECK_CUDA (getenv/atoi live in dense_decode_cfg.h)
 
 #include "traits.h"
 #include "params.h"
+#include "../../../utils.h"        // CHECK_CUDA / CHECK_CUDA_KERNEL_LAUNCH
+#include "dense_decode_cfg.h"      // shared CFG latch (also read by pybind.cpp)
+#include "splitkv_mla_mma.cuh"     // CFG>=1: raw mma.sync + split-KV tier
 
 using namespace cute;
 using namespace nvcuda;
@@ -665,11 +670,52 @@ void run_flash_splitkv_mla_kernel_impl(DecodingParams& params, cudaStream_t stre
     flash_fwd_splitkv_mla_sm120_kernel<T><<<grid, block, smem_size, stream>>>(params);
 }
 
+// CFG ladder (FLASH_MLA_SM120_DENSE_DECODE_CFG): 0 = legacy batch-parallel WMMA
+// (default, byte-identical), 1 = raw mma.sync + authors' split-KV scheduler
+// (splitkv_mla_mma.cuh; requires h_k == 1 -- MLA -- else legacy).
+// The SAME latch is read by get_attn_impl_meta (pybind.cpp): CFG>=1 makes the
+// metadata kernel emit real multi-split schedules that ONLY the mma tier
+// consumes; CFG=0 keeps num_sm_parts=1 so the combine kernel stays inert.
+// dense_decode_cfg() itself lives in dense_decode_cfg.h as a C++17 inline --
+// ONE static instance across both TUs, so metadata and launcher can never
+// disagree about the tier.
+
 void run_flash_splitkv_mla_kernel_bf16(DecodingParams& params, cudaStream_t stream) {
+    if (dense_decode_cfg() >= 1 && params.h_k == 1) {
+        // CFG>=2: small-head shapes take the single-pass retained-V tiers
+        // (each page streamed exactly once); CFG>=4 extends single-pass to
+        // q_seq_per_hk <= 32 via 32-token half-page tiles (covers h=22/32
+        // serving). Larger shapes keep the BM=64 split-KV tier. All tiers
+        // consume the same scheduler metadata.
+        if (dense_decode_cfg() >= 2 && params.q_seq_per_hk <= dense_decode_mma::DD_M16) {
+            dense_decode_mma::launch_dense_decode_mma_m16<__nv_bfloat16>(params, stream);
+            return;
+        }
+        if (dense_decode_cfg() >= 5 ||
+            (dense_decode_cfg() >= 4 && params.q_seq_per_hk <= dense_decode_mma::DD_M32)) {
+            dense_decode_mma::launch_dense_decode_mma_m32<__nv_bfloat16>(params, stream);
+            return;
+        }
+        dense_decode_mma::launch_dense_decode_mma<__nv_bfloat16>(params, stream);
+        return;
+    }
     run_flash_splitkv_mla_kernel_impl<cutlass::bfloat16_t>(params, stream);
 }
 
 void run_flash_splitkv_mla_kernel_fp16(DecodingParams& params, cudaStream_t stream) {
+    if (dense_decode_cfg() >= 1 && params.h_k == 1) {
+        if (dense_decode_cfg() >= 2 && params.q_seq_per_hk <= dense_decode_mma::DD_M16) {
+            dense_decode_mma::launch_dense_decode_mma_m16<__half>(params, stream);
+            return;
+        }
+        if (dense_decode_cfg() >= 5 ||
+            (dense_decode_cfg() >= 4 && params.q_seq_per_hk <= dense_decode_mma::DD_M32)) {
+            dense_decode_mma::launch_dense_decode_mma_m32<__half>(params, stream);
+            return;
+        }
+        dense_decode_mma::launch_dense_decode_mma<__half>(params, stream);
+        return;
+    }
     run_flash_splitkv_mla_kernel_impl<cutlass::half_t>(params, stream);
 }
 
