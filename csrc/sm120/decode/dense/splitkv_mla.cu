@@ -33,9 +33,14 @@
 #include <cutlass/arch/memory_sm80.h>
 #include <cute/tensor.hpp>
 #include <mma.h>
+#include <cstdio>    // fprintf/stderr used by CHECK_CUDA
+#include <cstdlib>   // exit used by CHECK_CUDA (getenv/atoi live in dense_decode_cfg.h)
 
 #include "traits.h"
 #include "params.h"
+#include "../../../utils.h"        // CHECK_CUDA / CHECK_CUDA_KERNEL_LAUNCH
+#include "dense_decode_cfg.h"      // shared CFG latch (also read by pybind.cpp)
+#include "splitkv_mla_mma.cuh"     // CFG>=1: raw mma.sync + split-KV tier
 
 using namespace cute;
 using namespace nvcuda;
@@ -220,7 +225,7 @@ __device__ void wmma_gemm_pv_tiled(
 // - Fully utilizes all SMs for large batch sizes (e.g., 128 batches = 256 blocks)
 //==============================================================================
 template<typename T>
-__global__ void __launch_bounds__(T::NUM_THREADS, 1)
+__global__ void __launch_bounds__(T::NUM_THREADS, 2)  // Allow 2 CTAs per SM for better occupancy
 flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
     using InputT = typename T::InputT;
     using SmemLayoutQ_tile = typename T::SmemLayoutQ_tile;
@@ -280,8 +285,8 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             sScale[thread_idx] = 1.0f;
         }
 
-        // Zero output accumulator
-        #pragma unroll
+        // Zero output accumulator - limit unroll to reduce register pressure
+        #pragma unroll 8
         for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
             rO[i] = 0.0f;
         }
@@ -292,23 +297,27 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
         // - q_batch_stride: stride for batch dimension
         // - q_row_stride: stride for q_seq_per_hk dimension (Q entries within KV group)
         // - q_head_stride: stride for num_heads_k dimension (KV head selection)
+        // 64-bit offset arithmetic: stride fields are int32 and the products can exceed
+        // INT32_MAX (e.g. the paged-KV pool at b=128, varlen s_k>=16384 reaches ~76K pages;
+        // page_id * k_batch_stride(36864) overflows at page ~58254 -> garbage reads that
+        // failed the authors' decode test at s_k>=16384 while s_k<=8192 still fit).
         const InputT* q_ptr = reinterpret_cast<const InputT*>(params.q_ptr) +
-                              batch_idx * params.q_batch_stride +
-                              m_block_idx * T::BLOCK_SIZE_M * params.q_row_stride +
-                              k_head_idx * params.q_head_stride;
+                              (int64_t)batch_idx * params.q_batch_stride +
+                              (int64_t)m_block_idx * T::BLOCK_SIZE_M * params.q_row_stride +
+                              (int64_t)k_head_idx * params.q_head_stride;
 
         const InputT* k_ptr = reinterpret_cast<const InputT*>(params.k_ptr) +
-                              k_head_idx * params.k_head_stride;
+                              (int64_t)k_head_idx * params.k_head_stride;
 
         // Output pointer: same layout as Q after reshape
         // O is [batch, q_seq_per_hk, num_heads_k, head_dim_v]
         InputT* o_ptr = reinterpret_cast<InputT*>(params.o_ptr) +
-                        batch_idx * params.o_batch_stride +
-                        m_block_idx * T::BLOCK_SIZE_M * params.o_row_stride +
-                        k_head_idx * params.o_head_stride;
+                        (int64_t)batch_idx * params.o_batch_stride +
+                        (int64_t)m_block_idx * T::BLOCK_SIZE_M * params.o_row_stride +
+                        (int64_t)k_head_idx * params.o_head_stride;
 
         float* lse_ptr = reinterpret_cast<float*>(params.softmax_lse_ptr) +
-                         (batch_idx * params.h_k + k_head_idx) * params.q_seq_per_hk +
+                         (int64_t)(batch_idx * params.h_k + k_head_idx) * params.q_seq_per_hk +
                          m_block_idx * T::BLOCK_SIZE_M;
 
         int* block_table_ptr = params.block_table + batch_idx * params.block_table_batch_stride;
@@ -319,7 +328,9 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             const int start_token_idx = block_idx * T::PAGE_BLOCK_SIZE;
             const int valid_tokens = min(seqlen_k - start_token_idx, T::PAGE_BLOCK_SIZE);
 
-            const InputT* kv_block_ptr = k_ptr + phys_block_idx * params.k_batch_stride;
+            // (int64_t) is REQUIRED: phys_block_idx * k_batch_stride overflows int32 once
+            // the page pool exceeds ~58K pages (INT32_MAX / 36864) -- see comment above.
+            const InputT* kv_block_ptr = k_ptr + (int64_t)phys_block_idx * params.k_batch_stride;
 
             // Clear score accumulator
             constexpr int score_elems = T::BLOCK_SIZE_M * T::PAGE_BLOCK_SIZE;
@@ -440,17 +451,33 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
             }
             __syncthreads();
 
+            // Bottom-right-aligned causal limit, per ROW (packed rows = s_q x q_head_per_hk;
+            // row r belongs to query position r / q_head_per_hk). Query q_i of s_q may attend
+            // keys j <= seqlen_k - s_q + q_i, i.e. row_valid = row_limit - start_token_idx with
+            // row_limit = seqlen_k - s_q + 1 + q_i. The last query sees everything (matches the
+            // authors' reference mask and pybind's s_q==1 -> is_causal=false shortcut). The old
+            // kernel IGNORED is_causal entirely: query 0 of s_q=2 attended the full sequence,
+            // failing the authors' decode test (~1% of elements, concentrated at q_i=0).
+            // Non-causal path: row_valid == valid_tokens, byte-identical behavior.
+
             // Row-wise max and online softmax update
             if (thread_idx < T::BLOCK_SIZE_M) {
+                int row_valid = valid_tokens;
+                if (params.is_causal) {
+                    const int q_i = (m_block_idx * T::BLOCK_SIZE_M + thread_idx) / params.q_head_per_hk;
+                    const int row_limit = seqlen_k - params.s_q + 1 + q_i;
+                    row_valid = min(valid_tokens, max(0, row_limit - start_token_idx));
+                }
                 float row_max = NEGATIVE_INFINITY;
                 #pragma unroll
                 for (int j = 0; j < T::PAGE_BLOCK_SIZE; ++j) {
-                    if (j < valid_tokens) {
+                    if (j < row_valid) {
                         row_max = fmaxf(row_max, sScores[thread_idx * T::PAGE_BLOCK_SIZE + j]);
                     }
                 }
 
-                // Update global max with rescaling
+                // Update global max with rescaling. NOTE row_max may stay NEGATIVE_INFINITY for
+                // a fully-masked block (row_valid == 0): new_max keeps old_max and rescale = 1.
                 float old_max = sM[thread_idx];
                 float new_max = fmaxf(old_max, row_max);
                 float rescale = (old_max == NEGATIVE_INFINITY) ? 1.0f :
@@ -464,13 +491,19 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
 
             // Compute exp(score - max) and accumulate row sum
             if (thread_idx < T::BLOCK_SIZE_M) {
+                int row_valid = valid_tokens;
+                if (params.is_causal) {
+                    const int q_i = (m_block_idx * T::BLOCK_SIZE_M + thread_idx) / params.q_head_per_hk;
+                    const int row_limit = seqlen_k - params.s_q + 1 + q_i;
+                    row_valid = min(valid_tokens, max(0, row_limit - start_token_idx));
+                }
                 float row_max = sM[thread_idx];
                 float row_sum = 0.0f;
 
                 #pragma unroll
                 for (int j = 0; j < T::PAGE_BLOCK_SIZE; ++j) {
                     int idx = thread_idx * T::PAGE_BLOCK_SIZE + j;
-                    if (j < valid_tokens) {
+                    if (j < row_valid) {
                         float exp_val = exp2f((sScores[idx] - row_max) * LOG2E);
                         sScores[idx] = exp_val;
                         row_sum += exp_val;
@@ -484,7 +517,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
 
             // Rescale previous output accumulator (flat layout)
             // Thread i owns output indices {i, i+256, i+512, ...}
-            #pragma unroll
+            #pragma unroll 8
             for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
                 int idx = thread_idx + i * T::NUM_THREADS;
                 int row = idx / T::HEAD_DIM_V;
@@ -555,7 +588,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
                 // All 256 threads read from sScores to accumulate their owned elements
                 const int tile_col_start = v_tile * V_TILE_DIM;
 
-                #pragma unroll
+                #pragma unroll 8
                 for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
                     // Flat layout: thread i owns indices {i, i+256, i+512, ...}
                     int global_out_idx = thread_idx + i * T::NUM_THREADS;
@@ -582,7 +615,7 @@ flash_fwd_splitkv_mla_sm120_kernel(const DecodingParams params) {
         //==================================================================
         const int num_valid_seq_q = min(params.q_seq_per_hk - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
 
-        #pragma unroll
+        #pragma unroll 8
         for (int i = 0; i < O_ELEMS_PER_THREAD; ++i) {
             int idx = thread_idx + i * T::NUM_THREADS;
             int row = idx / T::HEAD_DIM_V;
@@ -637,11 +670,52 @@ void run_flash_splitkv_mla_kernel_impl(DecodingParams& params, cudaStream_t stre
     flash_fwd_splitkv_mla_sm120_kernel<T><<<grid, block, smem_size, stream>>>(params);
 }
 
+// CFG ladder (FLASH_MLA_SM120_DENSE_DECODE_CFG): 0 = legacy batch-parallel WMMA
+// (default, byte-identical), 1 = raw mma.sync + authors' split-KV scheduler
+// (splitkv_mla_mma.cuh; requires h_k == 1 -- MLA -- else legacy).
+// The SAME latch is read by get_attn_impl_meta (pybind.cpp): CFG>=1 makes the
+// metadata kernel emit real multi-split schedules that ONLY the mma tier
+// consumes; CFG=0 keeps num_sm_parts=1 so the combine kernel stays inert.
+// dense_decode_cfg() itself lives in dense_decode_cfg.h as a C++17 inline --
+// ONE static instance across both TUs, so metadata and launcher can never
+// disagree about the tier.
+
 void run_flash_splitkv_mla_kernel_bf16(DecodingParams& params, cudaStream_t stream) {
+    if (dense_decode_cfg() >= 1 && params.h_k == 1) {
+        // CFG>=2: small-head shapes take the single-pass retained-V tiers
+        // (each page streamed exactly once); CFG>=4 extends single-pass to
+        // q_seq_per_hk <= 32 via 32-token half-page tiles (covers h=22/32
+        // serving). Larger shapes keep the BM=64 split-KV tier. All tiers
+        // consume the same scheduler metadata.
+        if (dense_decode_cfg() >= 2 && params.q_seq_per_hk <= dense_decode_mma::DD_M16) {
+            dense_decode_mma::launch_dense_decode_mma_m16<__nv_bfloat16>(params, stream);
+            return;
+        }
+        if (dense_decode_cfg() >= 5 ||
+            (dense_decode_cfg() >= 4 && params.q_seq_per_hk <= dense_decode_mma::DD_M32)) {
+            dense_decode_mma::launch_dense_decode_mma_m32<__nv_bfloat16>(params, stream);
+            return;
+        }
+        dense_decode_mma::launch_dense_decode_mma<__nv_bfloat16>(params, stream);
+        return;
+    }
     run_flash_splitkv_mla_kernel_impl<cutlass::bfloat16_t>(params, stream);
 }
 
 void run_flash_splitkv_mla_kernel_fp16(DecodingParams& params, cudaStream_t stream) {
+    if (dense_decode_cfg() >= 1 && params.h_k == 1) {
+        if (dense_decode_cfg() >= 2 && params.q_seq_per_hk <= dense_decode_mma::DD_M16) {
+            dense_decode_mma::launch_dense_decode_mma_m16<__half>(params, stream);
+            return;
+        }
+        if (dense_decode_cfg() >= 5 ||
+            (dense_decode_cfg() >= 4 && params.q_seq_per_hk <= dense_decode_mma::DD_M32)) {
+            dense_decode_mma::launch_dense_decode_mma_m32<__half>(params, stream);
+            return;
+        }
+        dense_decode_mma::launch_dense_decode_mma<__half>(params, stream);
+        return;
+    }
     run_flash_splitkv_mla_kernel_impl<cutlass::half_t>(params, stream);
 }
 

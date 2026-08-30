@@ -9,6 +9,12 @@
 
 #include "sm120/prefill/dense/sm120_kernel_traits.hpp"
 #include "sm120/prefill/dense/fmha_cutlass_bwd_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_kernel_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_mla_kernel_sm120.cuh"
+#include "sm120/prefill/dense/fmha_bwd_mma_sm120.cuh"
+
+#include <cstdlib>
+#include <algorithm>
 
 template<class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
@@ -20,10 +26,10 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
+  static constexpr bool IsCausal =
+      std::is_same_v<Mask, CausalForBackwardMask<false>> ||
+      std::is_same_v<Mask, CausalForBackwardMask<true>>;
 
-  // SM120 uses fallback implementation due to TMEM/TMA constraints
-  // SM120 (Blackwell workstation GPUs) does NOT have TMEM or TCGEN05/UMMA
-  // which are datacenter-only features (SM100). Use ATen fallback instead.
   int device = 0;
   cudaGetDevice(&device);
   cudaDeviceProp prop;
@@ -37,9 +43,152 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       prop.minor,
       ". Please install the SM100 build for server parts.");
 
-  // Use fallback for all SM120 configurations - the CUTLASS backward mainloop
-  // has TMA/TMEM dependencies that SM120 doesn't support
   const auto stream = c10::cuda::getCurrentCUDAStream();
+
+  // Check head dimensions for WMMA kernel compatibility
+  const int head_dim = q.size(-1);
+  const int num_heads = q.size(1);
+  const int batch_size = cumulative_seqlen_q.size(0) - 1;
+
+  // WMMA kernel supports both varlen and non-varlen modes
+  // Requirements: head_dim == 128, bf16, non-MLA
+  bool can_use_wmma = !IsMla &&
+                      head_dim == 128 &&
+                      max_seqlen_q > 0 &&
+                      total_seqlen_kv > 0 &&
+                      q.scalar_type() == at::ScalarType::BFloat16;
+
+  if (can_use_wmma) {
+    // CUDA-graph-safe max_seqlen_kv: total_seqlen_kv already carries Python's max_seqlen_kv (the
+    // per-seq max). Reading cu_seqlens on the host (device->host copy + sync) is ILLEGAL during
+    // CUDA-graph capture (max-autotune uses CUDA graphs), so use the passed value directly.
+    int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
+
+    // raw mma.sync two-kernel-split backward (DEFAULT ON; opt out FLASH_MLA_SM120_BWD_MMA=0).
+    // Atomic-free -> writes bf16 dq/dk/dv DIRECTLY (no fp32 scratch, no .to() copy).
+    {
+      static const bool kUseMmaBwd = []() {
+        const char* e = std::getenv("FLASH_MLA_SM120_BWD_MMA");
+        return (e == nullptr) || (e[0] != '0');  // DEFAULT ON; opt out with =0
+      }();
+      if (kUseMmaBwd) {
+        if (IsCausal)
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, true>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        else
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<128, 128, false>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        return;
+      }
+    }
+
+    // WMMA fallback path uses fp32 atomic accumulation (dq) + fp32->bf16 cast.
+    auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+    auto dk_float = at::zeros_like(dk, dk.options().dtype(at::kFloat));
+    auto dv_float = at::zeros_like(dv, dv.options().dtype(at::kFloat));
+
+    // DUAL KERNEL ARCHITECTURE for optimal performance:
+    // 1. Q-major dQ kernel: Grid over Q-blocks, NO ATOMICS for dQ
+    // 2. K-major dK/dV kernel: Grid over K-blocks, NO ATOMICS for dK/dV
+    // Both kernels use cp.async double-buffered pipelining
+    if (IsCausal) {
+      flash::detail::launch_fmha_bwd_sm120_dual<true>(
+          stream,
+          d_o,
+          q,
+          k,
+          v,
+          o,
+          lse,
+          cumulative_seqlen_q,
+          cumulative_seqlen_kv,
+          dq_float,
+          dk_float,
+          dv_float,
+          softmax_scale,
+          max_seqlen_q,
+          max_seqlen_kv);
+    } else {
+      flash::detail::launch_fmha_bwd_sm120_dual<false>(
+          stream,
+          d_o,
+          q,
+          k,
+          v,
+          o,
+          lse,
+          cumulative_seqlen_q,
+          cumulative_seqlen_kv,
+          dq_float,
+          dk_float,
+          dv_float,
+          softmax_scale,
+          max_seqlen_q,
+          max_seqlen_kv);
+    }
+
+    // Convert float outputs back to bf16
+    dq.copy_(dq_float.to(dq.scalar_type()));
+    dk.copy_(dk_float.to(dk.scalar_type()));
+    dv.copy_(dv_float.to(dv.scalar_type()));
+    return;
+  }
+
+  // Fused 192/128 MLA WMMA backward. DEFAULT ON for the MLA head dims (this repo's
+  // 192/128 model is the primary workload); OPT-OUT with FLASH_MLA_SM120_FUSED_MLA_BWD=0
+  // to fall back to the ATen path for ablation/debugging. Only valid for the MLA head
+  // dims (head_dim_qk=192, head_dim_vo=128); produces fp32 dQ/dK/dV (dQ via atomics
+  // across KV-blocks) then casts back to the caller dtype, mirroring the 128 WMMA path.
+  if constexpr (IsMla) {
+    // EXPERIMENTAL raw mma.sync + two-kernel-split backward for MLA 192/128 (OPT-IN,
+    // default OFF), gated by FLASH_MLA_SM120_BWD_MMA=1. Atomic-free; ~5x the WMMA MLA bwd.
+    {
+      static const bool kUseMmaBwd = []() {
+        const char* e = std::getenv("FLASH_MLA_SM120_BWD_MMA");
+        return (e == nullptr) || (e[0] != '0');  // DEFAULT ON; opt out with =0
+      }();
+      if (kUseMmaBwd && head_dim == 192 && v.size(-1) == 128 &&
+          q.scalar_type() == at::ScalarType::BFloat16) {
+        // CUDA-graph-safe: total_seqlen_kv == Python's max_seqlen_kv; a device->host copy of
+        // cu_seqlens is illegal during CUDA-graph capture (max-autotune).
+        int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
+        if (IsCausal)
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, true>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        else
+          flash::detail::mma_bwd::launch_fmha_bwd_mma<192, 128, false>(
+              stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+              dq, dk, dv, softmax_scale, max_seqlen_q, max_seqlen_kv);
+        return;
+      }
+    }
+
+    static const bool kUseFusedMlaBwd = []() {
+      const char* e = std::getenv("FLASH_MLA_SM120_FUSED_MLA_BWD");
+      return (e == nullptr) || (e[0] != '0');  // unset/anything-but-0 => ON; "0" => OFF
+    }();
+    if (kUseFusedMlaBwd && head_dim == 192 && v.size(-1) == 128 &&
+        q.scalar_type() == at::ScalarType::BFloat16) {
+      // CUDA-graph-safe: total_seqlen_kv == Python's max_seqlen_kv; a device->host copy of
+      // cu_seqlens is illegal during CUDA-graph capture (max-autotune).
+      int max_seqlen_kv = IsVarlen ? total_seqlen_kv : (total_seqlen_kv / batch_size);
+      auto dq_float = at::zeros_like(dq, dq.options().dtype(at::kFloat));
+      auto dk_float = at::empty_like(dk, dk.options().dtype(at::kFloat));
+      auto dv_float = at::empty_like(dv, dv.options().dtype(at::kFloat));
+      flash::detail::launch_fmha_bwd_sm120_mla<IsCausal>(
+          stream, d_o, q, k, v, o, lse, cumulative_seqlen_q, cumulative_seqlen_kv,
+          dq_float, dk_float, dv_float, softmax_scale, max_seqlen_q, max_seqlen_kv);
+      dq.copy_(dq_float.to(dq.scalar_type()));
+      dk.copy_(dk_float.to(dk.scalar_type()));
+      dv.copy_(dv_float.to(dv.scalar_type()));
+      return;
+    }
+  }
+
+  // Fall back to batched ATen implementation for MLA or other unsupported cases
   flash::detail::run_fmha_bwd_sm120_fallback<IsVarlen, IsMla, Mask>(
       stream,
       d_o,

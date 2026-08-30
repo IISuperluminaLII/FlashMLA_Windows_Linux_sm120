@@ -171,7 +171,7 @@ def get_arch_flags(target_arch: str):
 
 
 def get_nvcc_thread_args():
-    nvcc_threads = os.getenv("NVCC_THREADS") or "32"
+    nvcc_threads = (os.getenv("NVCC_THREADS") or "32").strip()
     return ["--threads", nvcc_threads]
 
 
@@ -196,7 +196,10 @@ VARIANTS = {
         "sources": [
             "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
             "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
+            "csrc/sm120/prefill/sparse/fwd.cu",
+            "csrc/sm120/prefill/sparse/bwd.cu",
             "csrc/sm120/decode/dense/splitkv_mla.cu",
+            "csrc/sm120/decode/sparse_fp8/splitkv_mla.cu",
         ],
         "defines": [
             "FLASH_MLA_BUILD_SM120",
@@ -276,8 +279,15 @@ ext_modules = [
             this_dir / "csrc" / "sm90",
             this_dir / "csrc" / "cutlass" / "include",
             this_dir / "csrc" / "cutlass" / "tools" / "util" / "include",
-            
-        ],
+        ]
+        # CUDA 13.x relocated the CCCL headers (cuda/std/*, cub, thrust) from
+        # ${CUDA_HOME}/include into ${CUDA_HOME}/include/cccl. nvcc adds that path
+        # automatically but the g++ HOST compile of pybind.cpp (which includes CUTLASS ->
+        # <cuda/std/utility>) does not, so add it explicitly. Existence-gated: absent on
+        # CUDA 12.x, so 12.x builds are byte-identical.
+        + ([Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "include" / "cccl"]
+           if (Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "include" / "cccl").is_dir()
+           else []),
     )
 ]
 

@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "../sched_meta.h"   // sm120::TileSchedulerMetaDataSize (shared w/ sparse_fp8)
+
 namespace sm120 {
 
 //==============================================================================
