@@ -3,43 +3,53 @@ Status:
 
 # SM120 FlashMLA Implementation Status
 
-## Currently Implemented (DENSE only)
+## Currently Implemented (DENSE + SPARSE, all paths)
 
 | Kernel             | Status   | Path                        |
 |--------------------|----------|-----------------------------|
-| Dense Decode       | WORKING  | `splitkv_mla.cu`            |
-| Dense Prefill Fwd  | WORKING  | `fmha_cutlass_fwd_sm120.cu` |
-| Dense Prefill Bwd  | WORKING  | `fmha_cutlass_bwd_sm120.cu` |
-| Sparse Prefill     | WIP      | `"WIP"`                     |
+| Dense Decode       | WORKING  | `splitkv_mla_mma.cuh`       |
+| Dense Prefill Fwd  | WORKING  | `fmha_fwd_mma_sm120.cuh`    |
+| Dense Prefill Bwd  | WORKING  | `fmha_bwd_mma_sm120.cuh`    |
+| Sparse Prefill Fwd | WORKING  | `fwd_mma.cuh`               |
+| Sparse Prefill Bwd | WORKING  | `bwd_mma.cuh`               |
+| Sparse FP8 Decode  | WORKING  | `splitkv_mla_mma.cuh`       |
 
-Sparse forward is working as expected with WMMA wraps. Training absolutely needs TMEM and > 110kb of smem
-The 99KB smem limit is blocking further tile size increases. The remaining performance gap is due to:
+All paths run on raw `mma.sync.m16n8k16` + `ldmatrix` + XOR-swizzled smem + cp.async
+(WMMA retired from every hot path). Training does NOT need TMEM or >110KB smem —
+the full 192/128 fwd+bwd beats SDPA 2.4-3.3x inside the real limits (99KB/block
+opt-in, 100KB/SM). The remaining gaps vs SM100 are architectural, not blocking:
 
-WMMA 16x16 tiles vs SM100's 64x128 TCGEN05 tiles
-No TMEM - forced to use limited smem
-No TMA - using slower cp.async
-Two kernel passes - both recompute full attention scores
+- mma.sync 16x8x16 vs TCGEN05 64x128 tiles — still reaches ~80% fwd / ~60% bwd of the 251.9 TF peak
+- No TMEM — register-resident accumulators + swizzled smem instead
+- No tensor TMA — cp.async pipelines (16B cap); cp.async.bulk 1D exists but unneeded
+- Two-kernel bwd split is deliberate: it deletes dQ atomics (measured 1.9x cost)
 
-## NOT Implemented (Sparse)
+## Perf vs strongest torch-native baseline
 
-| Kernel         | Status        | Error                                           |
-|----------------|---------------|-------------------------------------------------|
-| Sparse Decode  | NOT SUPPORTED | `"FlashMLA sparse decode kernels are disabled"` |
-| Sparse Prefill | NOT SUPPORTED | `"WIP"`                                         |
+| Path                        | Speedup                          |
+|-----------------------------|----------------------------------|
+| Dense training 192/128      | 2.4x @4K, 3.0x @8K (fwd+bwd)     |
+| Dense decode                | 15-24 GB/s -> 881-1538 GB/s      |
+| Sparse prefill fwd          | 2.63x (252-263 TF flat to 128K)  |
+| Sparse prefill fwd+bwd      | 3.01x                            |
+| Sparse fp8 decode           | 2.62x; serving 0.050 ms (~5x)    |
 
-## Why Sparse DECODE is Missing on SM120
+## Why Sparse works on SM120 after all
 
-SM120 (Blackwell GeForce/Workstation) lacks the **GMMA/TCGEN05** instructions needed for CUTLASS sparse attention. Only **SM90 (Hopper)** and **SM100 (Blackwell Data Center)** have the required sparse tensor core support.
+The old "needs GMMA/TCGEN05" claim was wrong — sparse MLA needed correct scheduling,
+swizzled smem, and cp.async pipelining on the SM80-class atoms sm_120 actually has.
+Full battery 129/129 at defaults AND at the recommended tiers (FWD=4,
+SPARSE_DECODE=4, BWD=2, DENSE=4), both toolchains (12.9+cu128, 13.0+cu130).
 
 ## Architecture Comparison
 
-| Feature     | SM90 (H100) | SM100 (B200) | SM120                 |
-|-------------|-------------|--------------|-----------------------|
-| Dense MLA   | Yes         | Yes          | Yes                   |
-| Sparse MLA  | Yes (FP8)   | Yes (FP8)    | No                    |
-| GMMA        | Yes         | Yes          | No                    |
-| WMMA        | Yes         | Yes          | Yes                   |
-
+| Feature     | SM90 (H100) | SM100 (B200) | SM120                     |
+|-------------|-------------|--------------|---------------------------|
+| Dense MLA   | Yes         | Yes          | Yes                       |
+| Sparse MLA  | Yes (FP8)   | Yes (FP8)    | Yes (FP8, ours)           |
+| GMMA/TCGEN05| GMMA        | TCGEN05      | No — mma.sync is the ceiling |
+| WMMA        | Yes         | Yes          | Yes (retired here)        |
+| Clusters/DSM| Yes         | No clusters  | Yes (proven; crossover slower here, 128MB L2 already dedups) |
 
 Also this is key for MSVC when converting any unix to linux: /Zc:__cplusplus
 
