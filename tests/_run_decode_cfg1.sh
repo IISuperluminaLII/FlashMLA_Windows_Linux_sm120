@@ -3,8 +3,8 @@
 # beat the gather+SDPA decode baseline (2.11 ms at b=128, s_q=2, topk=2048; WMMA was
 # 3.21 ms / 45-46 TFLOPS). Also: default-path (env unset) decode regression stays green.
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 

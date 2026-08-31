@@ -2,7 +2,8 @@
 # Rebuild the live .so (nvcc 13.0 / torch 2.13.0+cu130), then ptxas-probe the
 # dense decode TU for the mma kernel's register/spill stats (directive: 0 spill).
 set -u
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 bash build_wsl_sm120.sh 2>&1 | tail -3
 NVCC=/usr/local/cuda-13.0/bin/nvcc
 "$NVCC" -std=c++17 -arch=sm_120 -DFLASH_MLA_BUILD_SM120 \

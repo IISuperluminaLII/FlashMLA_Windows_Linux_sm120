@@ -6,7 +6,8 @@
 #   3) the crossover kernel's exchange-loop SASS (st.async/mapa/mbarrier encodings)
 #   4) profiler availability (ncu) for stall-level tracing
 set -u
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 SO=flash_mla/cuda_sm120.cpython-312-x86_64-linux-gnu.so
 CUOBJ=/usr/local/cuda-13.0/bin/cuobjdump
 

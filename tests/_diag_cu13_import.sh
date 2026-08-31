@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Diagnose flash_mla import resolution in the cu13 env from multiple cwds.
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM_cu13/bin/python
+export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM_cu13}"
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
 echo "--- python ---"
 "$PY" -c "import sys; print(sys.version.split()[0], sys.executable)"
 echo "--- from HOME ---"

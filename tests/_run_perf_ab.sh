@@ -3,8 +3,8 @@
 #  1. decode 34 regression + decode perf 8 (after the Phase-E unroll fix)
 #  2. sparse prefill perf: legacy (env unset) vs A0 (FLASH_MLA_SM120_SPARSE_FWD_CFG=1)
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 

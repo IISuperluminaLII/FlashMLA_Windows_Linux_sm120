@@ -1,4 +1,16 @@
 @echo off
+if not defined FLASHMLA_PY (
+    if defined CONDA_PREFIX (
+        set "FLASHMLA_PY=%CONDA_PREFIX%\python.exe"
+    ) else if exist "%USERPROFILE%\.conda\envs\150BLLM\python.exe" (
+        set "FLASHMLA_PY=%USERPROFILE%\.conda\envs\150BLLM\python.exe"
+    ) else if exist "%USERPROFILE%\miniconda3\envs\150BLLM\python.exe" (
+        set "FLASHMLA_PY=%USERPROFILE%\miniconda3\envs\150BLLM\python.exe"
+    ) else (
+        echo [WARN] no conda env 150BLLM found -- using python from PATH
+        set "FLASHMLA_PY=python"
+    )
+)
 echo Applying SM120 Blackwell Workstation Fixes based on community solutions...
 echo.
 
@@ -31,8 +43,8 @@ echo TORCH_CUDA_ARCH_LIST=%TORCH_CUDA_ARCH_LIST%
 echo.
 
 echo Step 3: Running build with SM120 configuration
-"C:\Users\Shashank Murthy\.conda\envs\150BLLM\python.exe" setup.py clean --all
-"C:\Users\Shashank Murthy\.conda\envs\150BLLM\python.exe" setup.py build_ext --inplace
+"%FLASHMLA_PY%" setup.py clean --all
+"%FLASHMLA_PY%" setup.py build_ext --inplace
 
 echo.
 echo Build complete. Check output for any errors.

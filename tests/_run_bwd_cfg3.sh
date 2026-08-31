@@ -6,8 +6,8 @@
 #   2) A/B fwd+bwd on the SDPA comparison row: CFG=2 (red.v2) vs CFG=3 (red.v4)
 #   3) default regression (env unset)
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 FAIL=0

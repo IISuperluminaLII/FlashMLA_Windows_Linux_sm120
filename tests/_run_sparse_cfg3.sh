@@ -4,8 +4,8 @@
 #   2) perf A/B: bench + serving shapes at CFG=3 (vs the recorded CFG=1/2 rows)
 #   3) default-path regression (env unset -> legacy WMMA)
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 

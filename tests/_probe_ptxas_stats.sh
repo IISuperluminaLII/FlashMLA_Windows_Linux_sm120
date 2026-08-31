@@ -4,7 +4,8 @@
 # spill for rO[128], A0 (full unroll) is the single most valuable change.
 # Acceptance gate from design-sparse-decode.md 7.5#2: decode kernel must show 0 spills.
 set -u
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 NVCC=/usr/local/cuda-12.9/bin/nvcc
 FLAGS="-O3 -std=c++17 -DNDEBUG -DFLASH_MLA_DISABLE_SM90 -DFLASH_MLA_DISABLE_SM100 -DFLASH_MLA_BUILD_SM120 \
   -gencode arch=compute_120,code=sm_120 \

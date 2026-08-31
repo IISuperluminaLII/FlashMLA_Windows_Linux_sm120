@@ -3,8 +3,8 @@
 # recommended tier set (FWD=4, BWD=2, DENSE=4, SPARSE_DECODE=1 bench / 4 serving;
 # dense prefill mma fwd+bwd are default-on). Sequential (max-2-tests rule).
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 
