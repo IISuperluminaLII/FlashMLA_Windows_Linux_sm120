@@ -2,7 +2,8 @@
 # Rebuild the live .so, then ptxas-probe the sparse fp8 decode TU: both mma tiers
 # (batch-parallel CFG=1 + splitkv CFG=2) must show 0 spill (operator directive).
 set -u
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 bash build_wsl_sm120.sh 2>&1 | tail -3
 NVCC=/usr/local/cuda-13.0/bin/nvcc
 "$NVCC" -std=c++17 -arch=sm_120 -DFLASH_MLA_BUILD_SM120 \

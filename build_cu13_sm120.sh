@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Build FlashMLA sm120 with nvcc 13.2 against torch 2.9.1+cu130 in the PARALLEL env
-# 150BLLM_cu13, inside an isolated copy at ~/flashmla_cu13 (never touches the live repo's
-# 12.9-built .so or the live training env). Battery then runs from the copy.
+# Build FlashMLA sm120 against the PARALLEL cu13 env inside an isolated copy
+# (never touches the live repo's .so or the live training env). Battery then
+# runs from the copy. Machine-agnostic: overrides via FLASHMLA_CONDA_ENV
+# (default 150BLLM_cu13), FLASHMLA_PYTHON, FLASHMLA_CU13_DIR, CUDA_HOME.
 set -e
-SRC=/mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
-DST="$HOME/flashmla_cu13"
-PY=/home/shashankm/miniconda3/envs/150BLLM_cu13/bin/python
+export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM_cu13}"
+source "$(dirname "${BASH_SOURCE[0]}")/env_sm120.sh"
+SRC="$FMLA_ROOT"
+DST="${FLASHMLA_CU13_DIR:-$HOME/flashmla_cu13}"
 
 rsync -a --delete \
   --exclude=build --exclude='*.so' --exclude='*.pyd' --exclude=__pycache__ \
@@ -15,10 +17,8 @@ rsync -a --delete \
 echo "RSYNC_DONE"
 
 cd "$DST"
-# CUDA 13.0 = EXACT match with torch 2.9.1+cu130's bundled runtime (13.0 == 13.0,
+# CUDA 13.0 = EXACT match with the cu13 torch's bundled runtime (13.0 == 13.0,
 # no version skew at all; 13.2 would compile too but warns on the minor).
-export CUDA_HOME=/usr/local/cuda-13.0
-export PATH="/usr/local/cuda-13.0/bin:$PATH"
 export FLASH_MLA_ARCH=sm120
 echo "nvcc: $(command -v nvcc) ($(nvcc --version | tail -1))"
 "$PY" setup.py build_ext --inplace 2>&1 | tail -3

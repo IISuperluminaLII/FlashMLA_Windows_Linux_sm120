@@ -3,8 +3,8 @@
 # the gather+SDPA baseline (3.23 ms at s_q=512 -> >= ~90 TFlops effective; authors' perf
 # shape reference: CFG3 was 21.4 TFlops / 109ms).
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 export FLASH_MLA_SM120_SPARSE_FWD_CFG=4

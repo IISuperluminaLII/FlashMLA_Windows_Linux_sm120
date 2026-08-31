@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # CFG=3 measurement only (decode + CFG 0/1/2 numbers already recorded).
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 export FLASH_MLA_SM120_SPARSE_FWD_CFG=3

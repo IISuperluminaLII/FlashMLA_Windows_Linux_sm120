@@ -6,9 +6,9 @@
 # Driver launches the kernel exactly once (correctness pass only, b=32).
 # Sections: SOL + memory workload + scheduler/warp stalls + occupancy.
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
 NCU=/usr/local/cuda-13.0/bin/ncu
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 

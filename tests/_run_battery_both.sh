@@ -13,8 +13,9 @@
 # Any suite failure propagates (run_battery.sh exits nonzero).
 # Usage: _run_battery_both.sh [python-path]
 set -u
-PY="${1:-/home/shashankm/miniconda3/envs/150BLLM/bin/python}"
-cd "$(dirname "$0")/.."
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+PY="${1:-$PY}"
+cd "$FMLA_ROOT"
 unset FLASH_MLA_SM120_SPARSE_FWD_CFG FLASH_MLA_SM120_SPARSE_DECODE_CFG \
       FLASH_MLA_SM120_SPARSE_BWD_CFG FLASH_MLA_SM120_DENSE_DECODE_CFG 2>/dev/null || true
 echo "=== BATTERY default (legacy paths) ==="

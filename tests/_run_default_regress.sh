@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Default-path regression after fwd.cu dispatch edit: CFG env UNSET -> legacy path must stay 24/24.
 set -u
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+cd "$FMLA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 unset FLASH_MLA_SM120_SPARSE_FWD_CFG

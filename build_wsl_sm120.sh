@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 set -e
-cd /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA
-# Live env moved to torch 2.13.0+cu130 (bundled CUDA runtime 13.0) -> the extension
-# MUST build with nvcc 13.0 (exact major.minor match; 12.9-built .so misreads the
-# cu13 cudaDeviceProp ABI and links the old libtorch ABI).
-export CUDA_HOME=/usr/local/cuda-13.0
-# Conda env bin FIRST: torch's BuildExtension only tracks HEADER dependencies
-# when the `ninja` executable is on PATH (pip installs it into the env bin, but
-# these scripts never activate the env). Without it torch falls back to
-# distutils' mtime-on-.cu-only check, so .cuh edits silently reuse stale
-# objects and relink/copy the OLD .so (observed: a "successful" rebuild shipped
-# a binary predating the fix it was meant to contain).
-export PATH="/home/shashankm/miniconda3/envs/150BLLM/bin:/usr/local/cuda-13.0/bin:$PATH"
+# Canonical WSL build for the sm120 extension. Machine-agnostic: repo root,
+# python and CUDA_HOME resolve via env_sm120.sh (override with FLASHMLA_PYTHON /
+# FLASHMLA_CONDA_ENV / CUDA_HOME).
+source "$(dirname "${BASH_SOURCE[0]}")/env_sm120.sh"
+cd "$FMLA_ROOT"
 export MAX_JOBS="${MAX_JOBS:-4}"   # ninja TU concurrency (each nvcc also runs --threads 32)
 export FLASH_MLA_ARCH=sm120
-PY=/home/shashankm/miniconda3/envs/150BLLM/bin/python
-SO=flash_mla/cuda_sm120.cpython-312-x86_64-linux-gnu.so
+
+# The .so name is python-ABI-derived, never hardcoded (cp312 today, anything later).
+SO="flash_mla/cuda_sm120$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+
+# The extension MUST build with an nvcc matching torch's bundled CUDA runtime
+# major.minor (a mismatched .so misreads the cudaDeviceProp ABI and links the
+# wrong libtorch ABI). Verified live, warned loudly, never assumed.
+TORCH_CUDA="$("$PY" -c 'import torch; print(torch.version.cuda)' 2>/dev/null || true)"
+NVCC_VER="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9.]*\),.*/\1/p')"
+if [ -n "$TORCH_CUDA" ] && [ -n "$NVCC_VER" ] && [ "$NVCC_VER" != "$TORCH_CUDA" ]; then
+    echo "[WARN] nvcc $NVCC_VER != torch bundled CUDA $TORCH_CUDA -- ABI skew risk; set CUDA_HOME to the matching toolkit"
+fi
 
 # Toolchain stamp: objects compiled under a DIFFERENT nvcc/torch must never be
 # reused (incremental builds skip recompilation by mtime and would silently link
 # stale-ABI objects into a "fresh" .so). Wipe build/ on any toolchain change.
 STAMP_FILE=build/.toolchain_stamp
-STAMP="$(command -v nvcc) $(nvcc --version | tail -1) torch=$($PY -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null)"
+STAMP="$(command -v nvcc) $(nvcc --version | tail -1) torch=$("$PY" -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null)"
 if [ ! -f "$STAMP_FILE" ] || [ "$(cat "$STAMP_FILE" 2>/dev/null)" != "$STAMP" ]; then
   echo "TOOLCHAIN_CHANGED -> clean rebuild"
   rm -rf build
@@ -35,7 +38,7 @@ if [ -f "$SO" ]; then
   mv -f "$SO" "${SO}.prebuild_bak"
   echo "MOVED_OLD_SO_ASIDE -> ${SO}.prebuild_bak"
 fi
-echo "BUILD_START $($PY --version) nvcc=$(command -v nvcc)"
+echo "BUILD_START $("$PY" --version) nvcc=$(command -v nvcc)"
 "$PY" setup.py build_ext --inplace
 
 # Closed-loop staleness guard: the produced .so must postdate EVERY source file

@@ -2,9 +2,10 @@
 # nvcc-13.0-vs-12.9 codegen A/B on IDENTICAL source: re-sync the cu13 copy (picks up the
 # full CFG ladder), rebuild with nvcc 13.0 + torch cu130 env, run the same perf sweeps.
 set -e
-bash /mnt/c/PyCharmProjectsSpaceConflict/150BLLM/external/FlashMLA/build_cu13_sm120.sh
+export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM_cu13}"
+source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
+bash "$FMLA_ROOT/build_cu13_sm120.sh"
 
-PY=/home/shashankm/miniconda3/envs/150BLLM_cu13/bin/python
 cd "$HOME/flashmla_cu13"
 export PYTHONPATH="$HOME/flashmla_cu13"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
