@@ -475,7 +475,9 @@ def _flash_attn_varlen_backward(
     if dv is None:
         dv = torch.empty(kv_total_len, num_kv_heads, head_dim_vo, device=q.device, dtype=q.dtype)
 
-    max_seqlen_qo_aligned = (max_seqlen_qo + 7) // 8 * 8
+    # 64-row alignment: the sm120 backward CFG>=6 fragment-order dQ workspace pads every batch to
+    # whole 64-row tiles (its launcher TORCH_CHECKs batch * ceil(max_seqlen/BM) * BM rows).
+    max_seqlen_qo_aligned = (max_seqlen_qo + 63) // 64 * 64
     bs = cu_seqlens_qo.shape[0] - 1
     workspace_bytes = 0
     workspace_bytes += 4 * bs * max_seqlen_qo_aligned * num_qo_heads * head_dim_qk  # dQ_acc

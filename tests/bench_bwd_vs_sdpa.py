@@ -15,6 +15,7 @@ DEV = "cuda"
 import flash_mla
 from flash_mla.flash_mla_interface import flash_attn_varlen_func, _flash_attn_varlen_backward, FLASH_MLA_LOADED_VARIANT
 PEAK = 251.9          # RTX PRO 6000 Blackwell dense bf16 TFLOPS
+BENCH_B = int(os.environ.get("BENCH_B", "2")); BENCH_H = int(os.environ.get("BENCH_H", "8"))   # shape overrides
 print(f"[INFO] variant={FLASH_MLA_LOADED_VARIANT} dev={torch.cuda.get_device_name(0)}")
 
 
@@ -62,4 +63,4 @@ def run(batch, S, H, D=128, causal=True):
 
 if __name__ == "__main__":
     for S in [1024, 2048, 4096]:
-        run(2, S, 8)
+        run(BENCH_B, S, BENCH_H)

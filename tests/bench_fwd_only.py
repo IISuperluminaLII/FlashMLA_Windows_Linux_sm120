@@ -43,9 +43,12 @@ def bench(batch, S, H, Dqk, Dvo, causal=True, iters=30, warmup=8):
 
 
 if __name__ == "__main__":
-    print("--- MLA 192/128 (model) ---")
-    for S in [512, 1024, 2048]:
-        bench(2, S, 8, 192, 128, causal=True)
-    print("--- 128/128 ---")
-    for S in [512, 1024, 2048]:
-        bench(2, S, 8, 128, 128, causal=True)
+    # BENCH_S_LIST=1024,4096,8192 overrides the sequence lengths (default small/device-0-safe)
+    S_LIST = [int(x) for x in os.environ.get("BENCH_S_LIST", "512,1024,2048").split(",")]
+    B = int(os.environ.get("BENCH_B", "2")); H = int(os.environ.get("BENCH_H", "8"))   # BENCH_B/BENCH_H override the shape
+    print(f"--- MLA 192/128 (model) b={B} H={H} ---")
+    for S in S_LIST:
+        bench(B, S, H, 192, 128, causal=True)
+    print(f"--- 128/128 b={B} H={H} ---")
+    for S in S_LIST:
+        bench(B, S, H, 128, 128, causal=True)

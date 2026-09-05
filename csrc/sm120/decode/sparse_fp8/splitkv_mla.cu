@@ -46,6 +46,10 @@ using namespace nvcuda;
 // mma.sync tier (CFG=1): raw mma.sync + ldmatrix + cp.async port of the WMMA kernel
 // below. Needs traits.h/dequant.h/params.h symbols from sm120::sparse_decode.
 #include "splitkv_mla_mma.cuh"
+// FP8 tensor-math tier (CFG=5/6): build opt-in FLASH_MLA_SM120_FP8_MMA=1 (setup.py -> -D).
+#ifdef FLASH_MLA_SM120_FP8_MMA
+#include "splitkv_mla_fp8mma.cuh"
+#endif
 
 namespace sm120 {
 namespace sparse_decode {
@@ -347,7 +351,32 @@ void run_sparse_fp8_decode_kernel(const SparseFP8DecodeParams& params) {
     // head-block count padded to full cluster pairs); CFG<2 keeps
     // num_sm_parts=1 so the combine stays inert and both batch-parallel tiers
     // ignore the metadata entirely.
-    const int decode_cfg = sparse_decode_cfg();
+    // ORTHOGONAL OPT ladder (FLASH_MLA_SM120_SPARSE_DECODE_OPT, sparse_decode_opt.h,
+    // default 0 = byte-identical): the CFG=1 and CFG=2/4 launchers below switch on
+    // it to the matching kernel instantiation (register-fragment K dequant, never-
+    // drain copy stream); the CFG=3 crossover (measured-closed) ignores it.
+    int decode_cfg = sparse_decode_cfg();
+    // FP8 tensor-math tiers 5 (batch-parallel) / 6 (split-KV, 192 cap). Without the build
+    // opt-in they degrade to the bf16-math tier of the SAME schedule (5 -> 1, 6 -> 4) with a
+    // one-time warning (agnostic: warn, never error out); the metadata arm derived its schedule
+    // from the rung's split-ness, which the fallback preserves.
+    if (decode_cfg == 5 || decode_cfg == 6) {
+#ifdef FLASH_MLA_SM120_FP8_MMA
+        if (decode_cfg == 5) fp8mma::launch_fp8mma<false>(params); else fp8mma::launch_fp8mma<true>(params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+#else
+        static const bool warned = [decode_cfg] {
+            std::fprintf(stderr, "[WARN] FLASH_MLA_SM120_SPARSE_DECODE_CFG=%d selects the FP8 tensor-math "
+                                 "tier but this extension was built without FLASH_MLA_SM120_FP8_MMA=1; "
+                                 "running the bf16-math tier %d of the same schedule\n",
+                         decode_cfg, decode_cfg == 5 ? 1 : 4);
+            return true;
+        }();
+        (void)warned;
+        decode_cfg = (decode_cfg == 5) ? 1 : 4;
+#endif
+    }
     if (decode_cfg == 3) {
         mma::launch_sparse_fp8_decode_mma_splitkv_x(params);
         CHECK_CUDA_KERNEL_LAUNCH();

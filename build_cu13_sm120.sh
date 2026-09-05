@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+# NOTE 2026-09-05: the LIVE env 150BLLM is torch 2.13.0+cu130 now; the parallel 150BLLM_cu13 env is obsolete -- operator directive: always use 150BLLM conda.
 # Build FlashMLA sm120 against the PARALLEL cu13 env inside an isolated copy
 # (never touches the live repo's .so or the live training env). Battery then
 # runs from the copy. Machine-agnostic: overrides via FLASHMLA_CONDA_ENV
-# (default 150BLLM_cu13), FLASHMLA_PYTHON, FLASHMLA_CU13_DIR, CUDA_HOME.
+# (default 150BLLM), FLASHMLA_PYTHON, FLASHMLA_CU13_DIR, CUDA_HOME.
 set -e
-export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM_cu13}"
+export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM}"
 source "$(dirname "${BASH_SOURCE[0]}")/env_sm120.sh"
 SRC="$FMLA_ROOT"
 DST="${FLASHMLA_CU13_DIR:-$HOME/flashmla_cu13}"

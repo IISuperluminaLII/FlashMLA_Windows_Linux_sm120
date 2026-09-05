@@ -7,6 +7,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/env_sm120.sh"
 cd "$FMLA_ROOT"
 export MAX_JOBS="${MAX_JOBS:-4}"   # ninja TU concurrency (each nvcc also runs --threads 32)
 export FLASH_MLA_ARCH=sm120
+# Build OPT-INS (default OFF, pass-through to setup.py): FLASH_MLA_SM120_FP8_MMA=1 compiles the
+# FP8 tensor-math sparse-decode tiers (SPARSE_DECODE_CFG=5/6). The value is part of the toolchain
+# stamp below, so toggling it forces a clean rebuild (objects built without the define are never
+# relinked as if they had it).
+export FLASH_MLA_SM120_FP8_MMA="${FLASH_MLA_SM120_FP8_MMA:-0}"
+echo "BUILD_OPTINS fp8_mma=$FLASH_MLA_SM120_FP8_MMA"
 
 # The .so name is python-ABI-derived, never hardcoded (cp312 today, anything later).
 SO="flash_mla/cuda_sm120$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
@@ -24,7 +30,7 @@ fi
 # reused (incremental builds skip recompilation by mtime and would silently link
 # stale-ABI objects into a "fresh" .so). Wipe build/ on any toolchain change.
 STAMP_FILE=build/.toolchain_stamp
-STAMP="$(command -v nvcc) $(nvcc --version | tail -1) torch=$("$PY" -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null)"
+STAMP="$(command -v nvcc) $(nvcc --version | tail -1) torch=$("$PY" -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null) fp8_mma=$FLASH_MLA_SM120_FP8_MMA"
 if [ ! -f "$STAMP_FILE" ] || [ "$(cat "$STAMP_FILE" 2>/dev/null)" != "$STAMP" ]; then
   echo "TOOLCHAIN_CHANGED -> clean rebuild"
   rm -rf build

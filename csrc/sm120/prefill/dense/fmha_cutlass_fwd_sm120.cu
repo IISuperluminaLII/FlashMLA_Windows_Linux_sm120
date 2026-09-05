@@ -94,16 +94,76 @@ void FMHACutlassSM120FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
       if (kUseMmaFwd && mma_mha && (mma_128 || mma_192)) {
         const auto stream = c10::cuda::getCurrentCUDAStream();
         const bool causal = (mask_mode == MaskMode::kCausal);
+        // FLASH_MLA_SM120_FWD_MMA_CFG ladder (0 = legacy byte-identical; 1 smem alias,
+        // 2 ldmatrix.x4, 3 exp2-folded softmax, 4 conditional rescale, 5 reversed causal
+        // order, 6 ILP, 7 BKV=64 staggered buffers, 8 warp-specialized 128-row CTA with the
+        // full/empty mbarrier pipeline, 9 = 8 with the cp.async.bulk row loader, 10 = 8 with
+        // the TMA tensor-map loader, 11 = 10 with FROST's kv_tile 128 single-stage split
+        // consumption). Read once.
+        static const int kFwdCfg = []() {
+          const char* e = std::getenv("FLASH_MLA_SM120_FWD_MMA_CFG");
+          int v = (e == nullptr) ? 0 : std::atoi(e);
+          return v < 0 ? 0 : (v > 12 ? 12 : v);
+        }();
+        // Diagnostic rungs (softmax skipped, WRONG numerics): a separate env so the CFG ladder
+        // can never select them; used only to measure a loop's tensor-only rate.
+        //   1 -> kCfg 99 (rung-7 loop), 2 -> kCfg 98 (rung-8 loop), 3 -> kCfg 97 (rung-11 loop),
+        //   4 -> kCfg 96 (rung-12 loop).
+        static const int kFwdDiag = []() {
+          const char* e = std::getenv("FLASH_MLA_SM120_FWD_MMA_DIAG_NOSOFTMAX");
+          int v = (e == nullptr) ? 0 : std::atoi(e);
+          return v < 0 ? 0 : (v > 4 ? 4 : v);
+        }();
+        auto run = [&](auto dqk_tag, auto causal_tag) {
+          constexpr int kDqk = decltype(dqk_tag)::value;
+          constexpr bool kC = decltype(causal_tag)::value;
+          // Timing diag (correct results, perturbed timing): rung 11 with per-phase clock64 attribution.
+          static const bool kFwdDiagTiming = []() {
+            const char* e = std::getenv("FLASH_MLA_SM120_FWD_MMA_DIAG_TIMING");
+            return e != nullptr && e[0] == '1';
+          }();
+          if (kFwdDiagTiming) {
+            flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 95>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+            return;
+          }
+          if (kFwdDiag == 1) {
+            flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 99>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+            return;
+          }
+          if (kFwdDiag == 2) {
+            flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 98>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+            return;
+          }
+          if (kFwdDiag == 3) {
+            flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 97>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+            return;
+          }
+          if (kFwdDiag == 4) {
+            flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 96>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+            return;
+          }
+          switch (kFwdCfg) {
+            case 1: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 1>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 2: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 2>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 3: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 3>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 4: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 4>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 5: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 5>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 6: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 6>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 7: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 7>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 8: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 8>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 9: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 9>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 10: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 10>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 11: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 11>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            case 12: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 12>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+            default: flash::detail::mma_fwd::launch_fmha_fwd_mma<kDqk, 128, kC, 0>(stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv); break;
+          }
+        };
         if (mma_192) {
-          if (causal) flash::detail::mma_fwd::launch_fmha_fwd_mma<192, 128, true>(
-              stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
-          else flash::detail::mma_fwd::launch_fmha_fwd_mma<192, 128, false>(
-              stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+          if (causal) run(std::integral_constant<int, 192>{}, std::true_type{});
+          else        run(std::integral_constant<int, 192>{}, std::false_type{});
         } else {
-          if (causal) flash::detail::mma_fwd::launch_fmha_fwd_mma<128, 128, true>(
-              stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
-          else flash::detail::mma_fwd::launch_fmha_fwd_mma<128, 128, false>(
-              stream, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale, max_seqlen_q, max_seqlen_kv);
+          if (causal) run(std::integral_constant<int, 128>{}, std::true_type{});
+          else        run(std::integral_constant<int, 128>{}, std::false_type{});
         }
         return;
       }

@@ -4,6 +4,7 @@
 
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 
 namespace sm120 {
 namespace sparse_decode {
@@ -59,6 +60,22 @@ bf16x8 cvt_fp8x8_bf16x8_fp32(const fp8x8 &inputs, const float &scale) {
     r.c = __floats2bfloat162_rn(hi.x * scale, hi.y * scale);
     r.d = __floats2bfloat162_rn(hi.z * scale, hi.w * scale);
     return r;
+}
+
+// Convert 2 FP8 elements -- one mma.m16n8k16 B-fragment pair, packed little-endian in a u16
+// exactly as the two bytes sit in the KV row -- to a packed bf16x2 with the FP32-domain scale
+// multiply. The 2-element form of cvt_fp8x8_bf16x8_fp32: __nv_fp8x2_e4m3 -> float2 is the
+// SAME cvt.rn.f16x2.e4m3x2 + f16->f32 sequence that __nv_fp8x4_e4m3::operator float4 runs per
+// half (cuda_fp8.hpp), followed by the same fp32 FMUL and the same single RN to bf16, so the
+// values are bit-identical to the smem dequant (and to tests/quant.py). Element k lands in the
+// low half, k+1 in the high half -- the B-fragment register convention (PTX ISA m16n8k16).
+// Used by the OPT>=1 K-path register-fragment dequant in splitkv_mla_mma.cuh.
+__device__ __forceinline__
+uint32_t cvt_fp8x2_bf16x2_fp32(const unsigned short raw, const float &scale) {
+    const __nv_fp8x2_e4m3 v = *reinterpret_cast<const __nv_fp8x2_e4m3*>(&raw);
+    const float2 f = (float2)(v);
+    const __nv_bfloat162 r = __floats2bfloat162_rn(f.x * scale, f.y * scale);
+    return *reinterpret_cast<const uint32_t*>(&r);
 }
 
 // Load 128 bits (16 FP8 elements) from global memory

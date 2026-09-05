@@ -16,6 +16,14 @@
 //             (combine gained 128/192 tiers; authors' 64 encoded H800's 132
 //             SMs). NOT the crossover: rung 4 routes to the splitkv kernel.
 //             Serving m_blocks=1 s_q=1 shapes go 64 -> 188 CTAs.
+//         5 = FP8 TENSOR-MATH batch-parallel (e4m3 x e4m3 mma.sync, whole block resident,
+//             no dequant, no V re-gather; audit/design-sparse-decode-fp8mma.md). NOT the
+//             authors' bit-faithful numerics (Q per-row e4m3, P' per-(row,group) e4m3).
+//             Compiled only with the build opt-in FLASH_MLA_SM120_FP8_MMA=1; otherwise the
+//             launcher warns once and runs rung 1 (same batch-parallel schedule).
+//         6 = FP8 tensor-math split-KV with the 192 cap (schedule of rung 4; falls back to 4).
+// The metadata arm derives split-ness from the rung (2/3/4/6 split; 0/1/5 batch-parallel)
+// so a build without the fp8-math kernels still sees a consistent schedule after fallback.
 #include <cstdlib>
 
 namespace sm120 {
@@ -24,9 +32,12 @@ inline int sparse_decode_cfg() {
     static const int cfg = [] {
         const char* e = std::getenv("FLASH_MLA_SM120_SPARSE_DECODE_CFG");
         const int v = e ? std::atoi(e) : 0;
-        return v < 0 ? 0 : (v > 4 ? 4 : v);
+        return v < 0 ? 0 : (v > 6 ? 6 : v);
     }();
     return cfg;
 }
+
+inline bool sparse_decode_cfg_is_split(int cfg) { return cfg == 2 || cfg == 3 || cfg == 4 || cfg == 6; }
+inline int  sparse_decode_cfg_split_cap(int cfg) { return (cfg == 4 || cfg == 6) ? 192 : 64; }
 
 }  // namespace sm120

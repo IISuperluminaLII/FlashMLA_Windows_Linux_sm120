@@ -26,11 +26,28 @@
 //   sP    bf16 [64][64]  swz(64)    8,192   P tile for the PV ldmatrix
 //   stats/scales/ptrs                2,112   (+64 B struct tail padding to 128)
 //   TOTAL sizeof = 100,480 B -> 1 CTA/SM
+//
+// OPT ladder (env FLASH_MLA_SM120_SPARSE_DECODE_OPT, sparse_decode_opt.h; template int kOpt
+// on the CFG=1 and CFG=2/4 kernels; 0 = every statement below verbatim, byte-identical SASS;
+// audit/design-sparse-decode-opt.md + audit/impl-sparse-decode-opt.md):
+//   1  K-path register-fragment dequant: the QK B fragment is read as two 2 B pairs of ONE
+//      token row straight from the fp8 stage (LDS.U16 x2 -> fp8x2 -> f32 -> *scale -> bf16x2,
+//      dequant.h cvt_fp8x2_bf16x2_fp32 = bit-identical values), no sKV round trip, ONE
+//      barrier per K tile (issue-after-barrier 2-stage ring). The stage rows are XOR-swizzled
+//      at 16 B granularity (d_fp8_swz) so the 8-row fragment reads are conflict-free at 0 B;
+//      the rope tile moves into sKV (dead during QK). V path unchanged (x2.trans + smem dequant
+//      into sKV), so sKV STAYS (the V tile needs it): smem unchanged at 100,480 B.
+//   2  never-drain copy stream: V tile 0 gathered at dt=7, the NEXT block's K tile 0 / scales
+//      at vt=6 / vt=7 from a parity buffer of token pointers resolved one block ahead
+//      (SmemPlanDecodeMmaOpt2, +640 B = 101,120 B). 26 barriers per block instead of 37.
 // ============================================================================
 
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
+#include <type_traits>
+#include "sparse_decode_opt.h"
 
 namespace sm120 {
 namespace sparse_decode {
@@ -99,6 +116,20 @@ struct SmemPlanDecodeMma {
 };
 static_assert(sizeof(SmemPlanDecodeMma) <= 99 * 1024, "decode mma smem exceeds 99KB");
 
+// Rung 2 (OPT>=2) plan: + a parity buffer holding the NEXT block's token pointers/validity
+// for the one-block-ahead K0/scales prefetch. Inherits the base layout so every OPT=0 member
+// access stays verbatim (sTokPtr/sValid keep their names and their "current block" role).
+// 100,480 + 512 + 128 = 101,120 B <= 101,376. The 256 B left cannot hold a second sScl
+// (1,024 B): the next block's scales therefore go into the single sScl at vt=7, after its
+// last reader of the block (dequant vt=7) has been fenced by SYNC_P2(7).
+struct SmemPlanDecodeMmaOpt2 : SmemPlanDecodeMma {
+    __align__(128) const uint8_t* sTokPtrN[DM_BTOPK];          // next block's row bases
+    __align__(128) int8_t sValidN[DM_BTOPK];
+};
+static_assert(sizeof(SmemPlanDecodeMmaOpt2) <= 99 * 1024, "decode mma OPT2 smem exceeds 99KB");
+static_assert(sizeof(SmemPlanDecodeMmaOpt2) == sizeof(SmemPlanDecodeMma) + 640,
+              "OPT2 parity buffers must append to the base plan (+512 +128 B)");
+
 // Gather one 64-token x 64-col FP8 tile (64 B/row = 4 x 16B granules) into stage `st`.
 // 256 granules / 256 threads = 1 each. Linear dst; the dequant step swizzles.
 __device__ __forceinline__ void gather_fp8_tile(SmemPlanDecodeMma& sm, int st, int col_start) {
@@ -152,11 +183,141 @@ __device__ __forceinline__ void dequant_tile(SmemPlanDecodeMma& sm, int st, int 
     store_128b(&sm.sKV[d_swz(r, c + 8, DM_DTILE)], hi);
 }
 
+// ============================================================================
+// OPT ladder helpers (kOpt >= 1). The OPT=0 helpers above are untouched.
+// ============================================================================
+
+// Swizzled fp8 stage address of 16 B granule g (0..3) of token row r (0..63): the granule
+// index is XORed with (r>>1)&3. WHY: the K-path register dequant reads 2 B pairs at a 64 B
+// row stride; a 64 B row is 16 banks, so rows {r, r+2, r+4, r+6} of an 8-row n-tile fall on
+// the SAME banks -> a 4-way conflict per LDS.U16 on the linear layout. XORing the granule
+// with (r>>1)&3 spreads those four rows over four distinct granules (bank quads); odd rows
+// sit 16 banks away. Result: the 8 rows x 2 banks of one fragment read hit 16 distinct banks
+// (the 4 lanes sharing a row read the same 4 B word = broadcast) -> conflict-free at 0 B.
+// Chosen over the 80 B row pad: the pad (+2,048 B) would push the rung-2 plan to 103,168 B
+// > 101,376 (sKV cannot be deleted -- the V dequant still needs it). Every 16 B granule
+// still lands whole and 16 B-aligned (cp.async 16 needs that); the gather and the V dequant
+// address granules through this map, and the 8 consecutive threads of a gather/dequant
+// phase still cover two whole rows = 128 contiguous bytes -> conflict-free as before.
+__device__ __forceinline__ int d_fp8_swz(int r, int g) {
+    return r * DM_DTILE + ((g ^ ((r >> 1) & 3)) << 4);
+}
+
+// gather_fp8_tile on the swizzled stage layout from EXPLICIT pointer/validity buffers (rung 2
+// feeds the next block's parity buffer through the same helper). Same thread map.
+__device__ __forceinline__ void gather_fp8_tile_swz(SmemPlanDecodeMma& sm, int st, int col_start,
+                                                    const uint8_t* const* tokptr,
+                                                    const int8_t* valid) {
+    const int tid = threadIdx.x;
+    const int r = tid >> 2;                    // token row 0..63
+    const int g = tid & 3;                     // 16 B granule 0..3
+    const uint8_t* tp = tokptr[r];
+    d_cp16(d_cvta(&sm.sFp8[st][d_fp8_swz(r, g)]), tp + col_start + g * 16,
+           valid[r] ? 16 : 0);
+}
+
+// Rope tile (bf16, swz(64)) into sKV instead of the sFp8 union: under OPT>=1 the K-path mma
+// reads the stages DIRECTLY until the end of dt=7, so the union is never free for the rope,
+// while sKV is dead for the whole QK phase (the V dequant is its only other writer). Same
+// layout the rope ldmatrix expects (== the OPT=0 sKV K-tile layout); same thread map as
+// gather_rope_tile.
+__device__ __forceinline__ void gather_rope_tile_skv(SmemPlanDecodeMma& sm,
+                                                     const uint8_t* const* tokptr,
+                                                     const int8_t* valid) {
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int g = tid + i * DM_THREADS;
+        const int r = g >> 3;
+        const int c = (g & 7) * 8;
+        const uint8_t* tp = tokptr[r];
+        d_cp16(d_cvta(&sm.sKV[d_swz(r, c, DM_DTILE)]),
+               tp + DM_ROPE_BYTE_OFF + c * 2, valid[r] ? 16 : 0);
+    }
+}
+
+// gather_scales from explicit buffers (rung 2 prefetches the next block's scales).
+__device__ __forceinline__ void gather_scales_at(SmemPlanDecodeMma& sm,
+                                                 const uint8_t* const* tokptr,
+                                                 const int8_t* valid) {
+    const int tid = threadIdx.x;
+    if (tid < DM_BTOPK) {
+        const uint8_t* tp = tokptr[tid];
+        d_cp16(d_cvta(&sm.sScl[tid][0]), tp + HEAD_DIM_NOPE, valid[tid] ? 16 : 0);
+    }
+}
+
+// dequant_tile on the swizzled stage layout (V path only under OPT>=1). Same math, same
+// destination layout; only the source granule address goes through d_fp8_swz.
+__device__ __forceinline__ void dequant_tile_swz(SmemPlanDecodeMma& sm, int st, int dt) {
+    const int tid = threadIdx.x;
+    const int r = tid >> 2;                    // token row 0..63
+    const int g = tid & 3;                     // 16 B granule 0..3 == element col g*16
+    const float scale = sm.sScl[r][dt >> 1];
+    const fp8x16 raw = *reinterpret_cast<const fp8x16*>(&sm.sFp8[st][d_fp8_swz(r, g)]);
+    const bf16x8 lo = cvt_fp8x8_bf16x8_fp32(raw.lo, scale);
+    const bf16x8 hi = cvt_fp8x8_bf16x8_fp32(raw.hi, scale);
+    store_128b(&sm.sKV[d_swz(r, g * 16, DM_DTILE)], lo);
+    store_128b(&sm.sKV[d_swz(r, g * 16 + 8, DM_DTILE)], hi);
+}
+
+// K-path register-fragment dequant (rung 1). The m16n8k16 B fragment of lane l is
+// {K[n0 + l/4][k0 + (l%4)*2, +1], K[n0 + l/4][k0 + 8 + (l%4)*2, +1]}: two 2 B pairs of ONE
+// token row. kp points at the first pair inside the swizzled stage row; the second pair sits
+// 8 B further in the same granule. fp32-domain math == dequant.h (bit-identical values).
+__device__ __forceinline__ void d_kfrag_regdq(uint32_t (&Kr)[2], const uint8_t* kp, float scale) {
+    const unsigned short lo = *reinterpret_cast<const unsigned short*>(kp);
+    const unsigned short hi = *reinterpret_cast<const unsigned short*>(kp + 8);
+    Kr[0] = cvt_fp8x2_bf16x2_fp32(lo, scale);
+    Kr[1] = cvt_fp8x2_bf16x2_fp32(hi, scale);
+}
+
+// Token pointers + validity of block kb into EXPLICIT buffers (tid < 64, own index only):
+// the OPT=0 phase-A statements plus a walk-end guard -- blocks at or beyond blk_hi (the
+// exclusive end of this CTA's walk) resolve ALL-INVALID, so the rung-2 one-block-ahead
+// prefetch issued during the walk's last block degenerates to src-size-0 zero-fills that
+// read no memory (and idx_row is never read past the walk). ONLY token == -1 is invalid.
+__device__ __forceinline__ void d_phase_a(const uint8_t** tokptr, int8_t* valid,
+                                          const int* idx_row, const uint8_t* kv_base,
+                                          const SparseFP8DecodeParams& params,
+                                          int kb, int blk_hi) {
+    const int tid = threadIdx.x;
+    if (tid < DM_BTOPK) {
+        const int k = kb * DM_BTOPK + tid;
+        const int token = (kb < blk_hi && k < params.topk) ? idx_row[k] : -1;
+        const bool ok = (token >= 0);
+        valid[tid] = ok ? 1 : 0;
+        tokptr[tid] = ok ? (kv_base
+                            + (int64_t)(token >> 6) * params.kv_page_stride
+                            + (int64_t)(token & 63) * params.kv_token_stride)
+                         : kv_base;    // legal address; src-size 0 keeps it unread
+    }
+}
+
+// Implemented rung for the latched OPT value: rung 3 (V-path half-tile dequant/mma software
+// pipelining) is reserved but NOT implemented -> route to rung 2 and say so once (warn, never
+// error out).
+inline int sparse_decode_opt_rung() {
+    static const int rung = [] {
+        const int opt = sparse_decode_opt();
+        if (opt > 2) {
+            std::fprintf(stderr, "[WARN] FLASH_MLA_SM120_SPARSE_DECODE_OPT=%d: rung 3 is not "
+                                 "implemented; running rung 2\n", opt);
+            return 2;
+        }
+        return opt;
+    }();
+    return rung;
+}
+
 // ---- kernel -----------------------------------------------------------------
+// kOpt = FLASH_MLA_SM120_SPARSE_DECODE_OPT rung (sparse_decode_opt.h); 0 = byte-identical.
+template <int kOpt>
 __global__ void __launch_bounds__(DM_THREADS, 1)
 sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
+    using Plan = std::conditional_t<(kOpt >= 2), SmemPlanDecodeMmaOpt2, SmemPlanDecodeMma>;
     extern __shared__ char smem_raw[];
-    SmemPlanDecodeMma& sm = *reinterpret_cast<SmemPlanDecodeMma*>(smem_raw);
+    Plan& sm = *reinterpret_cast<Plan*>(smem_raw);
 
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int m_block_idx = blockIdx.x;
@@ -207,7 +368,37 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
 
     const int num_topk_blocks = (params.topk + DM_BTOPK - 1) / DM_BTOPK;
 
+    if constexpr (kOpt >= 2) {
+        // ---- rung 2 prologue: block 0's pointers straight into the working buffer, then
+        // its scales + K tile 0 in flight BEFORE the loop; every later block's K0/scales come
+        // from the previous block's vt=6/vt=7 prefetch. (The barrier also publishes sQ.)
+        // topk == 0 (no blocks): all-invalid zero-fills, drained after the loop.
+        d_phase_a(sm.sTokPtr, sm.sValid, idx_row, kv_base, params, 0, num_topk_blocks);
+        __syncthreads();          // sTokPtr/sValid (+ sQ) visible to the 256 gather threads
+        gather_scales_at(sm, sm.sTokPtr, sm.sValid);
+        gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);
+        d_cp_commit();            // group {Scl(0), K0(0)}
+    }
+
     for (int kb = 0; kb < num_topk_blocks; ++kb) {
+        if constexpr (kOpt >= 2) {
+            // ---- rung 2: token pointers ONE BLOCK AHEAD, no SYNC_A (tid<64, own index).
+            // Promote block kb's pointers (resolved during block kb-1 into the parity buffer,
+            // or by the prologue for kb=0) to the working buffer, then resolve block kb+1 into
+            // the parity buffer for this block's vt=6/vt=7 prefetch.
+            //   working buffer WAR: block kb-1's last readers (its V7 gather at the vt=6 top,
+            //   its masking before SYNC_M1) precede SYNC_P1(6) of block kb-1, which these
+            //   writers passed. RAW: published by SYNC_Q(0) below (first readers: this
+            //   block's K1 gather and masking).
+            //   parity buffer WAR: block kb-1's readers were its vt=6 K0 gather (all threads,
+            //   before SYNC_P1(7)) and its vt=7 scales gather (these same tid<64 threads,
+            //   program order). RAW: SYNC_Q(0) (first reader: the vt=6 K0 gather).
+            if (tid < DM_BTOPK && kb > 0) {
+                sm.sTokPtr[tid] = sm.sTokPtrN[tid];
+                sm.sValid[tid] = sm.sValidN[tid];
+            }
+            d_phase_a(sm.sTokPtrN, sm.sValidN, idx_row, kv_base, params, kb + 1, num_topk_blocks);
+        } else {
         // ---- token pointers + validity (decode: ONLY -1 is invalid) --------
         if (tid < DM_BTOPK) {
             const int k = kb * DM_BTOPK + tid;
@@ -220,12 +411,97 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
                                  : kv_base;    // legal address; src-size 0 keeps it unread
         }
         __syncthreads();
+        }
 
         // ---- QK: S[64h x 64t] over 9 d-tiles (8 fp8 + 1 rope), registers ---
         float Sr[4][4];
         #pragma unroll
         for (int n = 0; n < 4; ++n) { Sr[n][0] = Sr[n][1] = Sr[n][2] = Sr[n][3] = 0.f; }
 
+        if constexpr (kOpt >= 1) {
+            // ---- OPT>=1 QK: the K-tile B fragments are built by the mma warps STRAIGHT
+            // from the swizzled fp8 stage (register-fragment dequant, no sKV round trip),
+            // ONE barrier per K tile on a 2-stage issue-after-barrier ring:
+            //   wait -> SYNC_Q(dt) -> gather K(dt+1) into the stage mma(dt-1) drained -> mma(dt)
+            // Per-lane constants: fragment row = n0 + lane/4, byte pairs (lane%4)*2 and +8;
+            // koff = row base (bits 6+) + pair offset (bits 1-2) + swizzle key (bits 4-5:
+            // (row>>1)&3 == (lane>>3)&3 for every n-tile because n0 % 8 == 0), so the
+            // swizzled granule of d-step dl is koff ^ (dl*16) and n-tile n adds n*512.
+            const int koff = (nh * 32 + (lane >> 2)) * DM_DTILE + (lane & 3) * 2
+                           + (((lane >> 3) & 3) << 4);
+            if constexpr (kOpt < 2) {
+                gather_scales_at(sm, sm.sTokPtr, sm.sValid);          // rung 1: this
+                gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);  // block's scales +
+                d_cp_commit();    // group {Scl(kb), K0(kb)}            // K0 issued here
+            }
+            for (int dt = 0; dt < DM_NFP8TILES; ++dt) {
+                const int cur = dt & 1;
+                // Ledger (per thread): dt=0 pending {Scl+K0} (rung 1) / {K0(kb)},{Scl(kb)}
+                // (rung 2: from the previous block's vt=6/7 or the prologue) -> wait<0>;
+                // dt=1 pending {K1},{rope} -> wait<1> retires K1 (the rope may still fly);
+                // dt>=2 pending {rope} (dt=2 only),{K(dt)} -> wait<0>.
+                if (dt == 1) d_cp_wait<1>(); else d_cp_wait<0>();
+                __syncthreads();  // SYNC_Q(dt). RAW: stage cur (at dt=0 also sScl + the
+                                  // pointer buffers, at dt>=2 the rope in sKV) visible to
+                                  // every warp. WAR: every warp is past its mma(dt-1) reads
+                                  // of stage cur^1, which the gather below overwrites -- and
+                                  // at dt=0 past the previous block's V mma(7) reads of sKV,
+                                  // which the rope gather overwrites.
+                if (dt + 1 < DM_NFP8TILES) {
+                    gather_fp8_tile_swz(sm, cur ^ 1, (dt + 1) * DM_DTILE, sm.sTokPtr, sm.sValid);
+                    d_cp_commit();    // group {K(dt+1)}: lands under mma(dt)
+                    if (dt == 0) {
+                        gather_rope_tile_skv(sm, sm.sTokPtr, sm.sValid);
+                        d_cp_commit(); // group {rope}: retired by dt=2's wait<0>, read after dt=7
+                    }
+                } else if constexpr (kOpt >= 2) {
+                    // Rung 2(a): V tile 0 into stage 0 NOW -- its last readers, mma(6), are
+                    // behind SYNC_Q(7) -- so it lands under mma(7) + rope mma + softmax.
+                    gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);
+                    d_cp_commit();    // group {V0}
+                }
+                float sc[4];          // this lane's 4 fragment rows' scales for this d-tile
+                #pragma unroll
+                for (int n = 0; n < 4; ++n)
+                    sc[n] = sm.sScl[(nh * 4 + n) * DM_MMA_N + (lane >> 2)][dt >> 1];
+                #pragma unroll
+                for (int dl = 0; dl < 4; ++dl) {
+                    uint32_t Qr[4];
+                    {
+                        const int row = wrow + (lane % 16);
+                        const int col = dt * DM_DTILE + dl * DM_MMA_K + (lane / 16) * 8;
+                        d_ldm_x4(Qr, d_cvta(&sm.sQ[d_swz(row, col, DM_DQK)]));
+                    }
+                    const int kd = koff ^ (dl * 16);   // swizzled 16 B granule of d-step dl
+                    #pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        uint32_t Kr[2];
+                        d_kfrag_regdq(Kr, &sm.sFp8[cur][kd + n * (DM_MMA_N * DM_DTILE)], sc[n]);
+                        d_mma(Sr[n], Qr, Kr, Sr[n]);
+                    }
+                }
+            }
+            {   // rope d-tile (dt == 8): bf16 from sKV. Landed by dt=2's wait<0> on every
+                // thread and published by SYNC_Q(2..7): no wait, no barrier here.
+                #pragma unroll
+                for (int dl = 0; dl < 4; ++dl) {
+                    uint32_t Qr[4];
+                    {
+                        const int row = wrow + (lane % 16);
+                        const int col = DM_DV + dl * DM_MMA_K + (lane / 16) * 8;
+                        d_ldm_x4(Qr, d_cvta(&sm.sQ[d_swz(row, col, DM_DQK)]));
+                    }
+                    #pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        uint32_t Kr[2];
+                        const int krow = (nh * 4 + n) * DM_MMA_N + (lane % 8);
+                        const int kcol = dl * DM_MMA_K + ((lane / 8) % 2) * 8;
+                        d_ldm_x2(Kr, d_cvta(&sm.sKV[d_swz(krow, kcol, DM_DTILE)]));
+                        d_mma(Sr[n], Qr, Kr, Sr[n]);
+                    }
+                }
+            }
+        } else {
         gather_scales(sm);
         gather_fp8_tile(sm, 0, 0);
         d_cp_commit();
@@ -284,6 +560,7 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
                     d_mma(Sr[n], Qr, Kr, Sr[n]);
                 }
             }
+        }
         }
 
         // ---- mask invalid tokens, scale, per-lane partial max ---------------
@@ -354,6 +631,75 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
         // ---- PV: 8 V tiles = the fp8 nope tiles re-gathered + re-dequantized
         // (sFp8's rope contents are dead now; the softmax combine syncs above
         //  separate the rope ldmatrix reads from this overwrite.)
+        if constexpr (kOpt >= 1) {
+            // ---- OPT>=1 PV: the V path is structurally OPT=0 (2-stage gather, smem dequant
+            // into sKV, x2.trans) on the swizzled stages. Rung 2: V0 is already in flight
+            // (issued at dt=7) and the NEXT block's K tile 0 / scales are issued at vt=6 /
+            // vt=7, so the vt=7 wait leaves exactly ONE (newer) group pending. No block-
+            // bottom barrier (note after the loop).
+            if constexpr (kOpt < 2) {
+                gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);  // V0 -> stage 0: its last
+                d_cp_commit();    // group {V0}                        // readers, mma(6), are behind SYNC_Q(7)
+            }
+            #pragma unroll
+            for (int vt = 0; vt < DM_NVTILES; ++vt) {
+                const int cur = vt & 1;
+                if (vt + 1 < DM_NVTILES) {
+                    // stage cur^1: last readers dequant(vt-1), behind SYNC_P2(vt-1); for vt=0
+                    // the K-path mma(7) reads of stage 1, behind SYNC_M1/SYNC_M2.
+                    gather_fp8_tile_swz(sm, cur ^ 1, (vt + 1) * DM_DTILE, sm.sTokPtr, sm.sValid);
+                    d_cp_commit();    // group {V(vt+1)}
+                    d_cp_wait<1>();   // pending {V(vt)},{V(vt+1)}: the older, V(vt), landed
+                } else if constexpr (kOpt >= 2) {
+                    d_cp_wait<1>();   // pending {V7},{K0(kb+1)}: V7 (older) landed, K0 may fly
+                } else {
+                    d_cp_wait<0>();   // pending {V7}
+                }
+                __syncthreads();      // SYNC_P1(vt): stage cur landed for all; prior V mma done (sKV free)
+                dequant_tile_swz(sm, cur, vt);
+                __syncthreads();      // SYNC_P2(vt): sKV (V tile) + sP visible; stage cur consumed by all
+                if constexpr (kOpt >= 2) {
+                    if (vt == 6) {
+                        // Rung 2(b): the NEXT block's K tile 0 into stage 0 (tile 6 consumed by
+                        // every thread at SYNC_P2(6)); pointers from the parity buffer, resolved
+                        // at this block's start and published by SYNC_Q(0). At the last block
+                        // this is an all-invalid zero-fill (d_phase_a), drained after the loop.
+                        gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtrN, sm.sValidN);
+                        d_cp_commit();    // group {K0(kb+1)}
+                    }
+                    if (vt == 7) {
+                        // The NEXT block's scales into the single sScl: this block's last
+                        // readers of it (dequant vt=7; the K path long before) are behind
+                        // SYNC_P2(7). Both prefetch groups retire at the next dt=0 wait<0>.
+                        gather_scales_at(sm, sm.sTokPtrN, sm.sValidN);
+                        d_cp_commit();    // group {Scl(kb+1)}
+                    }
+                }
+                #pragma unroll
+                for (int pk = 0; pk < 4; ++pk) {
+                    uint32_t Pr[4];
+                    {
+                        const int prow = wrow + (lane % 16);
+                        const int pcol = pk * DM_MMA_K + (lane / 16) * 8;
+                        d_ldm_x4(Pr, d_cvta(&sm.sP[d_swz(prow, pcol, DM_BTOPK)]));
+                    }
+                    #pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        uint32_t Vr[2];
+                        const int vrow = pk * DM_MMA_K + (lane % 16);
+                        const int vcol = nh * 32 + n * DM_MMA_N + (lane / 16) * 8;
+                        d_ldm_x2_trans(Vr, d_cvta(&sm.sKV[d_swz(vrow, vcol, DM_DTILE)]));
+                        d_mma(Or[vt][n], Pr, Vr, Or[vt][n]);
+                    }
+                }
+            }
+            // No block-bottom barrier under OPT>=1. The next block's first writes are: the
+            // pointer buffers (tid<64, after every reader of them passed SYNC_P1(6) at the
+            // latest -- phase-A notes), sScl / stage 0 (rung 1: issued after SYNC_A; rung 2:
+            // issued above at vt=7 / vt=6, behind SYNC_P2(7) / SYNC_P2(6), their last
+            // readers), stage 1 and sKV (after SYNC_Q(0), which every warp reaches only after
+            // its own mma(7)), and sP (after SYNC_M2 of the next block).
+        } else {
         gather_fp8_tile(sm, 0, 0);
         d_cp_commit();
         #pragma unroll
@@ -388,7 +734,11 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
             }
         }
         __syncthreads();   // last V mma done before next kb rewrites sTokPtr/sFp8/sP
+        }
     }
+    if constexpr (kOpt >= 2) d_cp_wait<0>();   // retire the last block's (all-invalid, zero-
+                                               // fill) K0/scales prefetch: nothing may outlive
+                                               // the kernel or leak into the epilogue
 
     // ---- epilogue -----------------------------------------------------------
     rsum[0] += __shfl_xor_sync(0xffffffff, rsum[0], 1);
@@ -435,13 +785,24 @@ sparse_fp8_decode_mma_kernel(const SparseFP8DecodeParams params) {
     }
 }
 
+template <int kOpt>
+inline void launch_sparse_fp8_decode_mma_opt(const SparseFP8DecodeParams& params, const dim3& grid) {
+    using Plan = std::conditional_t<(kOpt >= 2), SmemPlanDecodeMmaOpt2, SmemPlanDecodeMma>;
+    constexpr size_t smem = sizeof(Plan);
+    CHECK_CUDA(cudaFuncSetAttribute(sparse_fp8_decode_mma_kernel<kOpt>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    sparse_fp8_decode_mma_kernel<kOpt><<<grid, dim3(DM_THREADS), smem, params.stream>>>(params);
+}
+
 inline void launch_sparse_fp8_decode_mma(const SparseFP8DecodeParams& params) {
     const int num_m_blocks = (params.q_head_per_hk + DM_BH - 1) / DM_BH;
     const dim3 grid(num_m_blocks, params.s_q, params.b);
-    constexpr size_t smem = sizeof(SmemPlanDecodeMma);
-    CHECK_CUDA(cudaFuncSetAttribute(sparse_fp8_decode_mma_kernel,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    sparse_fp8_decode_mma_kernel<<<grid, dim3(DM_THREADS), smem, params.stream>>>(params);
+    // OPT ladder (FLASH_MLA_SM120_SPARSE_DECODE_OPT, read once): 0 = legacy byte-identical.
+    switch (sparse_decode_opt_rung()) {
+        case 1:  launch_sparse_fp8_decode_mma_opt<1>(params, grid); break;
+        case 2:  launch_sparse_fp8_decode_mma_opt<2>(params, grid); break;
+        default: launch_sparse_fp8_decode_mma_opt<0>(params, grid); break;
+    }
 }
 
 // ============================================================================
@@ -460,10 +821,13 @@ inline void launch_sparse_fp8_decode_mma(const SparseFP8DecodeParams& params) {
 
 constexpr float DM_LOG2E = 1.4426950408889634f;
 
+// kOpt = FLASH_MLA_SM120_SPARSE_DECODE_OPT rung (sparse_decode_opt.h); 0 = byte-identical.
+template <int kOpt>
 __global__ void __launch_bounds__(DM_THREADS, 1)
 sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
+    using Plan = std::conditional_t<(kOpt >= 2), SmemPlanDecodeMmaOpt2, SmemPlanDecodeMma>;
     extern __shared__ char smem_raw[];
-    SmemPlanDecodeMma& sm = *reinterpret_cast<SmemPlanDecodeMma*>(smem_raw);
+    Plan& sm = *reinterpret_cast<Plan*>(smem_raw);
 
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int m_block_idx = blockIdx.x;
@@ -535,10 +899,38 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
             #pragma unroll
             for (int n = 0; n < 4; ++n) { Or[t][n][0] = Or[t][n][1] = Or[t][n][2] = Or[t][n][3] = 0.f; }
 
+        if constexpr (kOpt >= 2)   // rung 2: the walk's first block's pointers -> working buffer
+            d_phase_a(sm.sTokPtr, sm.sValid, idx_row, kv_base, params, blk_lo, blk_hi);
         __syncthreads();   // sQ visible; previous batch's smem fully consumed
                            // (also closes the empty-walk sStatS overwrite race)
+        if constexpr (kOpt >= 2) {
+            // ---- rung 2 prologue: the first block's scales + K tile 0 in flight BEFORE the
+            // walk; every later block's K0/scales come from the previous block's vt=6/vt=7
+            // prefetch. An empty walk issues all-invalid zero-fills, drained after the loop.
+            gather_scales_at(sm, sm.sTokPtr, sm.sValid);
+            gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);
+            d_cp_commit();            // group {Scl(blk_lo), K0(blk_lo)}
+        }
 
         for (int kb = blk_lo; kb < blk_hi; ++kb) {
+            if constexpr (kOpt >= 2) {
+                // ---- rung 2: token pointers ONE BLOCK AHEAD, no SYNC_A (tid<64, own index).
+                // Promote block kb's pointers (resolved during block kb-1 into the parity
+                // buffer, or by the prologue for the first block) to the working buffer, then
+                // resolve block kb+1 into the parity buffer for this block's vt=6/7 prefetch.
+                //   working buffer WAR: block kb-1's last readers (its V7 gather at the vt=6
+                //   top, its masking before SYNC_M1) precede SYNC_P1(6) of block kb-1, which
+                //   these writers passed. RAW: published by SYNC_Q(0) below (first readers:
+                //   this block's K1 gather and masking).
+                //   parity buffer WAR: block kb-1's readers were its vt=6 K0 gather (all
+                //   threads, before SYNC_P1(7)) and its vt=7 scales gather (these same tid<64
+                //   threads, program order). RAW: SYNC_Q(0) (first reader: the vt=6 K0 gather).
+                if (tid < DM_BTOPK && kb > blk_lo) {
+                    sm.sTokPtr[tid] = sm.sTokPtrN[tid];
+                    sm.sValid[tid] = sm.sValidN[tid];
+                }
+                d_phase_a(sm.sTokPtrN, sm.sValidN, idx_row, kv_base, params, kb + 1, blk_hi);
+            } else {
             // ---- token pointers + validity (decode: ONLY -1 is invalid) ----
             if (tid < DM_BTOPK) {
                 const int k = kb * DM_BTOPK + tid;
@@ -551,12 +943,97 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
                                      : kv_base;   // legal address; src-size 0 keeps it unread
             }
             __syncthreads();
+            }
 
             // ---- QK: S[64h x 64t] over 9 d-tiles (8 fp8 + 1 rope), registers
             float Sr[4][4];
             #pragma unroll
             for (int n = 0; n < 4; ++n) { Sr[n][0] = Sr[n][1] = Sr[n][2] = Sr[n][3] = 0.f; }
 
+            if constexpr (kOpt >= 1) {
+                // ---- OPT>=1 QK: the K-tile B fragments are built by the mma warps STRAIGHT
+                // from the swizzled fp8 stage (register-fragment dequant, no sKV round trip),
+                // ONE barrier per K tile on a 2-stage issue-after-barrier ring:
+                //   wait -> SYNC_Q(dt) -> gather K(dt+1) into the stage mma(dt-1) drained -> mma(dt)
+                // Per-lane constants: fragment row = n0 + lane/4, byte pairs (lane%4)*2 and +8;
+                // koff = row base (bits 6+) + pair offset (bits 1-2) + swizzle key (bits 4-5:
+                // (row>>1)&3 == (lane>>3)&3 for every n-tile because n0 % 8 == 0), so the
+                // swizzled granule of d-step dl is koff ^ (dl*16) and n-tile n adds n*512.
+                const int koff = (nh * 32 + (lane >> 2)) * DM_DTILE + (lane & 3) * 2
+                               + (((lane >> 3) & 3) << 4);
+                if constexpr (kOpt < 2) {
+                    gather_scales_at(sm, sm.sTokPtr, sm.sValid);          // rung 1: this
+                    gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);  // block's scales +
+                    d_cp_commit();    // group {Scl(kb), K0(kb)}            // K0 issued here
+                }
+                for (int dt = 0; dt < DM_NFP8TILES; ++dt) {
+                    const int cur = dt & 1;
+                    // Ledger (per thread): dt=0 pending {Scl+K0} (rung 1) / {K0(kb)},{Scl(kb)}
+                    // (rung 2: from the previous block's vt=6/7 or the prologue) -> wait<0>;
+                    // dt=1 pending {K1},{rope} -> wait<1> retires K1 (the rope may still fly);
+                    // dt>=2 pending {rope} (dt=2 only),{K(dt)} -> wait<0>.
+                    if (dt == 1) d_cp_wait<1>(); else d_cp_wait<0>();
+                    __syncthreads();  // SYNC_Q(dt). RAW: stage cur (at dt=0 also sScl + the
+                                      // pointer buffers, at dt>=2 the rope in sKV) visible to
+                                      // every warp. WAR: every warp is past its mma(dt-1) reads
+                                      // of stage cur^1, which the gather below overwrites -- and
+                                      // at dt=0 past the previous block's V mma(7) reads of sKV,
+                                      // which the rope gather overwrites.
+                    if (dt + 1 < DM_NFP8TILES) {
+                        gather_fp8_tile_swz(sm, cur ^ 1, (dt + 1) * DM_DTILE, sm.sTokPtr, sm.sValid);
+                        d_cp_commit();    // group {K(dt+1)}: lands under mma(dt)
+                        if (dt == 0) {
+                            gather_rope_tile_skv(sm, sm.sTokPtr, sm.sValid);
+                            d_cp_commit(); // group {rope}: retired by dt=2's wait<0>, read after dt=7
+                        }
+                    } else if constexpr (kOpt >= 2) {
+                        // Rung 2(a): V tile 0 into stage 0 NOW -- its last readers, mma(6), are
+                        // behind SYNC_Q(7) -- so it lands under mma(7) + rope mma + softmax.
+                        gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);
+                        d_cp_commit();    // group {V0}
+                    }
+                    float sc[4];          // this lane's 4 fragment rows' scales for this d-tile
+                    #pragma unroll
+                    for (int n = 0; n < 4; ++n)
+                        sc[n] = sm.sScl[(nh * 4 + n) * DM_MMA_N + (lane >> 2)][dt >> 1];
+                    #pragma unroll
+                    for (int dl = 0; dl < 4; ++dl) {
+                        uint32_t Qr[4];
+                        {
+                            const int row = wrow + (lane % 16);
+                            const int col = dt * DM_DTILE + dl * DM_MMA_K + (lane / 16) * 8;
+                            d_ldm_x4(Qr, d_cvta(&sm.sQ[d_swz(row, col, DM_DQK)]));
+                        }
+                        const int kd = koff ^ (dl * 16);   // swizzled 16 B granule of d-step dl
+                        #pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            uint32_t Kr[2];
+                            d_kfrag_regdq(Kr, &sm.sFp8[cur][kd + n * (DM_MMA_N * DM_DTILE)], sc[n]);
+                            d_mma(Sr[n], Qr, Kr, Sr[n]);
+                        }
+                    }
+                }
+                {   // rope d-tile (dt == 8): bf16 from sKV. Landed by dt=2's wait<0> on every
+                    // thread and published by SYNC_Q(2..7): no wait, no barrier here.
+                    #pragma unroll
+                    for (int dl = 0; dl < 4; ++dl) {
+                        uint32_t Qr[4];
+                        {
+                            const int row = wrow + (lane % 16);
+                            const int col = DM_DV + dl * DM_MMA_K + (lane / 16) * 8;
+                            d_ldm_x4(Qr, d_cvta(&sm.sQ[d_swz(row, col, DM_DQK)]));
+                        }
+                        #pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            uint32_t Kr[2];
+                            const int krow = (nh * 4 + n) * DM_MMA_N + (lane % 8);
+                            const int kcol = dl * DM_MMA_K + ((lane / 8) % 2) * 8;
+                            d_ldm_x2(Kr, d_cvta(&sm.sKV[d_swz(krow, kcol, DM_DTILE)]));
+                            d_mma(Sr[n], Qr, Kr, Sr[n]);
+                        }
+                    }
+                }
+            } else {
             gather_scales(sm);
             gather_fp8_tile(sm, 0, 0);
             d_cp_commit();
@@ -615,6 +1092,7 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
                         d_mma(Sr[n], Qr, Kr, Sr[n]);
                     }
                 }
+            }
             }
 
             // ---- mask invalid tokens, scale, per-lane partial max -----------
@@ -683,6 +1161,75 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
             rsum[1] = rsum[1] * rs1 + tsum[1];
 
             // ---- PV: 8 V tiles = the fp8 nope tiles re-gathered + re-dequantized
+            if constexpr (kOpt >= 1) {
+                // ---- OPT>=1 PV: the V path is structurally OPT=0 (2-stage gather, smem
+                // dequant into sKV, x2.trans) on the swizzled stages. Rung 2: V0 is already in
+                // flight (issued at dt=7) and the NEXT block's K tile 0 / scales are issued at
+                // vt=6 / vt=7, so the vt=7 wait leaves exactly ONE (newer) group pending. No
+                // block-bottom barrier (note after the loop).
+                if constexpr (kOpt < 2) {
+                    gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtr, sm.sValid);  // V0 -> stage 0: its last
+                    d_cp_commit();    // group {V0}                        // readers, mma(6), are behind SYNC_Q(7)
+                }
+                #pragma unroll
+                for (int vt = 0; vt < DM_NVTILES; ++vt) {
+                    const int cur = vt & 1;
+                    if (vt + 1 < DM_NVTILES) {
+                        // stage cur^1: last readers dequant(vt-1), behind SYNC_P2(vt-1); for
+                        // vt=0 the K-path mma(7) reads of stage 1, behind SYNC_M1/SYNC_M2.
+                        gather_fp8_tile_swz(sm, cur ^ 1, (vt + 1) * DM_DTILE, sm.sTokPtr, sm.sValid);
+                        d_cp_commit();    // group {V(vt+1)}
+                        d_cp_wait<1>();   // pending {V(vt)},{V(vt+1)}: the older, V(vt), landed
+                    } else if constexpr (kOpt >= 2) {
+                        d_cp_wait<1>();   // pending {V7},{K0(kb+1)}: V7 (older) landed, K0 may fly
+                    } else {
+                        d_cp_wait<0>();   // pending {V7}
+                    }
+                    __syncthreads();      // SYNC_P1(vt): stage cur landed for all; prior V mma done (sKV free)
+                    dequant_tile_swz(sm, cur, vt);
+                    __syncthreads();      // SYNC_P2(vt): sKV (V tile) + sP visible; stage cur consumed by all
+                    if constexpr (kOpt >= 2) {
+                        if (vt == 6) {
+                            // Rung 2(b): the NEXT block's K tile 0 into stage 0 (tile 6 consumed
+                            // by every thread at SYNC_P2(6)); pointers from the parity buffer,
+                            // resolved at this block's start and published by SYNC_Q(0). At the
+                            // walk's last block this is an all-invalid zero-fill (d_phase_a).
+                            gather_fp8_tile_swz(sm, 0, 0, sm.sTokPtrN, sm.sValidN);
+                            d_cp_commit();    // group {K0(kb+1)}
+                        }
+                        if (vt == 7) {
+                            // The NEXT block's scales into the single sScl: this block's last
+                            // readers of it (dequant vt=7; the K path long before) are behind
+                            // SYNC_P2(7). Both prefetch groups retire at the next dt=0 wait<0>.
+                            gather_scales_at(sm, sm.sTokPtrN, sm.sValidN);
+                            d_cp_commit();    // group {Scl(kb+1)}
+                        }
+                    }
+                    #pragma unroll
+                    for (int pk = 0; pk < 4; ++pk) {
+                        uint32_t Pr[4];
+                        {
+                            const int prow = wrow + (lane % 16);
+                            const int pcol = pk * DM_MMA_K + (lane / 16) * 8;
+                            d_ldm_x4(Pr, d_cvta(&sm.sP[d_swz(prow, pcol, DM_BTOPK)]));
+                        }
+                        #pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            uint32_t Vr[2];
+                            const int vrow = pk * DM_MMA_K + (lane % 16);
+                            const int vcol = nh * 32 + n * DM_MMA_N + (lane / 16) * 8;
+                            d_ldm_x2_trans(Vr, d_cvta(&sm.sKV[d_swz(vrow, vcol, DM_DTILE)]));
+                            d_mma(Or[vt][n], Pr, Vr, Or[vt][n]);
+                        }
+                    }
+                }
+                // No block-bottom barrier under OPT>=1. The next block's first writes are:
+                // the pointer buffers (tid<64, after every reader of them passed SYNC_P1(6)
+                // at the latest -- phase-A notes), sScl / stage 0 (rung 1: issued after
+                // SYNC_A; rung 2: issued above at vt=7 / vt=6, behind SYNC_P2(7) / SYNC_P2(6),
+                // their last readers), stage 1 and sKV (after SYNC_Q(0), which every warp
+                // reaches only after its own mma(7)), and sP (after SYNC_M2 of the next block).
+            } else {
             gather_fp8_tile(sm, 0, 0);
             d_cp_commit();
             #pragma unroll
@@ -717,7 +1264,11 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
                 }
             }
             __syncthreads();   // last V mma done before next kb rewrites sTokPtr/sFp8/sP
+            }
         }
+        if constexpr (kOpt >= 2) d_cp_wait<0>();   // retire the walk's last (all-invalid, zero-
+                                                   // fill) K0/scales prefetch before the next
+                                                   // batch re-targets stage 0 / sScl
 
         // ---- epilogue for this batch ---------------------------------------
         rsum[0] += __shfl_xor_sync(0xffffffff, rsum[0], 1);
@@ -801,13 +1352,25 @@ sparse_fp8_decode_mma_splitkv_kernel(const SparseFP8DecodeParams params) {
     }
 }
 
+template <int kOpt>
+inline void launch_sparse_fp8_decode_mma_splitkv_opt(const SparseFP8DecodeParams& params,
+                                                     const dim3& grid) {
+    using Plan = std::conditional_t<(kOpt >= 2), SmemPlanDecodeMmaOpt2, SmemPlanDecodeMma>;
+    constexpr size_t smem = sizeof(Plan);
+    CHECK_CUDA(cudaFuncSetAttribute(sparse_fp8_decode_mma_splitkv_kernel<kOpt>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    sparse_fp8_decode_mma_splitkv_kernel<kOpt><<<grid, dim3(DM_THREADS), smem, params.stream>>>(params);
+}
+
 inline void launch_sparse_fp8_decode_mma_splitkv(const SparseFP8DecodeParams& params) {
     const int num_m_blocks = (params.q_head_per_hk + DM_BH - 1) / DM_BH;
     const dim3 grid(num_m_blocks, params.s_q, params.num_sm_parts);
-    constexpr size_t smem = sizeof(SmemPlanDecodeMma);
-    CHECK_CUDA(cudaFuncSetAttribute(sparse_fp8_decode_mma_splitkv_kernel,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    sparse_fp8_decode_mma_splitkv_kernel<<<grid, dim3(DM_THREADS), smem, params.stream>>>(params);
+    // OPT ladder (FLASH_MLA_SM120_SPARSE_DECODE_OPT, read once): 0 = legacy byte-identical.
+    switch (sparse_decode_opt_rung()) {
+        case 1:  launch_sparse_fp8_decode_mma_splitkv_opt<1>(params, grid); break;
+        case 2:  launch_sparse_fp8_decode_mma_splitkv_opt<2>(params, grid); break;
+        default: launch_sparse_fp8_decode_mma_splitkv_opt<0>(params, grid); break;
+    }
 }
 
 // ============================================================================

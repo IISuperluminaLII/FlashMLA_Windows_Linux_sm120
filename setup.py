@@ -125,6 +125,11 @@ def get_features_args(for_msvc: bool = False, extra_defines=None):
         append_unique("FLASH_MLA_FORCE_FALLBACK")
     if is_flag_set("FLASH_MLA_FORCE_BWD_FALLBACK"):
         append_unique("FLASH_MLA_FORCE_BWD_FALLBACK")
+    # sm120 build OPT-IN: compile the FP8 tensor-math sparse-decode tiers (e4m3 x e4m3 mma.sync,
+    # FLASH_MLA_SM120_SPARSE_DECODE_CFG=5/6; audit/design-sparse-decode-fp8mma.md). Default OFF:
+    # without it those rungs warn once and run the bf16-math tier of the same schedule.
+    if is_flag_set("FLASH_MLA_SM120_FP8_MMA"):
+        append_unique("FLASH_MLA_SM120_FP8_MMA")
 
     for define in extra_defines or []:
         append_unique(define)

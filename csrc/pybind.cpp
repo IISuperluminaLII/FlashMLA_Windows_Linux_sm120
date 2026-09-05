@@ -386,7 +386,10 @@ DecodingAttnImplMeta get_attn_impl_meta(
             // -> exit(1) (a host process kill, not a Python exception). The cap must
             // equal the active rung's combine tier: 64 (authors') for CFG=2/3, 192
             // for CFG=4 (128/192 tiers added in mla_combine.cu for this 188-SM card).
-            if (sm120::sparse_decode_cfg() >= 2) {
+            // Rungs 5/6 (fp8 tensor math) share the schedules of 1/4: split-ness and cap come
+            // from sparse_decode_cfg_is_split / _split_cap (sparse_decode_cfg.h), the same
+            // classification the launcher's no-fp8-build fallback preserves.
+            if (sm120::sparse_decode_cfg_is_split(sm120::sparse_decode_cfg())) {
                 const int s_q = num_q_tokens_per_head_k * h_k / h_q_.value();
                 int num_m_blocks = cutlass::ceil_div(h_q_.value() / h_k, 64);
                 // CFG=3 (only) launches full 2-CTA cluster pairs: the grid pads
@@ -398,7 +401,7 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 // carries 128/192 MLA_NUM_SPLITS_SWITCH tiers, so the full
                 // 188-SM board is reachable (m_blocks=1 s_q=1 serving shapes
                 // were stranded at 64 CTAs). CFG=2/3 keep the authors' 64.
-                const int split_cap = (sm120::sparse_decode_cfg() == 4) ? 192 : 64;
+                const int split_cap = sm120::sparse_decode_cfg_split_cap(sm120::sparse_decode_cfg());
                 const int num_sm_parts = std::min(
                     split_cap, std::max(1, sm_count / std::max(1, num_m_blocks * s_q)));
                 return { num_sm_parts, 5, 64 };
@@ -1214,4 +1217,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
     m.def("sparse_prefill_bwd", &sparse_prefill_bwd);
     m.attr("__flash_mla_variant__") = kFlashMlaVariantName;
+    // Build opt-in visibility: tests/benches assert the FP8 tensor-math tiers (SPARSE_DECODE_CFG
+    // 5/6) are really compiled in rather than silently running the bf16-math fallback.
+#ifdef FLASH_MLA_SM120_FP8_MMA
+    m.attr("__sm120_fp8_mma__") = true;
+#else
+    m.attr("__sm120_fp8_mma__") = false;
+#endif
 }

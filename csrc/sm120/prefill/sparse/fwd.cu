@@ -34,6 +34,7 @@
 #include <cstdio>    // fprintf/stderr used by CHECK_CUDA
 #include "../../../utils.h"   // CHECK_CUDA / CHECK_CUDA_KERNEL_LAUNCH
 #include "fwd_mma.cuh"   // CFG>=4: raw mma.sync + ldmatrix + cp.async sparse kernel (F1 tier)
+#include "fwd_ws.cuh"    // CFG>=5: the CFG=4 math on a 2-stage FULL/EMPTY mbarrier ring (static 17-slot schedule)
 
 using namespace cute;
 using namespace nvcuda;
@@ -717,11 +718,38 @@ void run_sparse_fwd_kernel(const SparsePrefillParams& params) {
     //   3 = +A2/A3/A4 parallel base-2 softmax + closed-form PV write-back;
     //   4 = F1: raw mma.sync + ldmatrix + XOR swizzle + cp.async gather pipeline
     //       (fwd_mma.cuh -- resident Q, streamed gathered KV, V-share semantics).
+    //   5 = the CFG=4 math (bitwise-identical output) on a FULL/EMPTY mbarrier-driven 2-stage
+    //       ring with a static 17-slot schedule, no CTA-wide barrier in the mainloop, pair-local
+    //       softmax exchange (fwd_ws.cuh; design audit/design-sparse-fwd-structural.md).
+    //   6, 7 = reserved structural rungs (residency inversion, cluster multicast) NOT yet built:
+    //       they run rung 5 and print a one-time [WARN].
+    // FLASH_MLA_SM120_SPARSE_FWD_DIAG (rung 5 only, read once): 0 production; 1 RED probe (WAR
+    //   waits removed + adversarial warp-7 skew: the suites must FAIL); 2 softmax skipped (GEMM-
+    //   pipeline ceiling, bench only); 3 the skew alone with the protocol intact (must pass).
     static const int fwd_cfg = []() {
         const char* e = getenv("FLASH_MLA_SM120_SPARSE_FWD_CFG");
         int v = e ? atoi(e) : 0;
-        return (v < 0 || v > 4) ? 0 : v;
+        return (v < 0 || v > 7) ? 0 : v;
     }();
+    static const int fwd_diag = []() {
+        const char* e = getenv("FLASH_MLA_SM120_SPARSE_FWD_DIAG");
+        int v = e ? atoi(e) : 0;
+        return (v < 0 || v > 3) ? 0 : v;
+    }();
+
+    if (fwd_cfg >= 5) {
+        if (fwd_cfg > 5) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[WARN] FLASH_MLA_SM120_SPARSE_FWD_CFG=%d: sparse fwd rung %d is not built yet; "
+                                "running rung 5\n", fwd_cfg, fwd_cfg);
+            }
+        }
+        sparse_ws::launch_sparse_fwd_ws<5>(params, fwd_diag);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        return;
+    }
 
     if (fwd_cfg == 4) {
         sparse_mma::launch_sparse_fwd_mma(params);

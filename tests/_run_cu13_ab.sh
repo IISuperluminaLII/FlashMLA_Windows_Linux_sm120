@@ -2,7 +2,7 @@
 # nvcc-13.0-vs-12.9 codegen A/B on IDENTICAL source: re-sync the cu13 copy (picks up the
 # full CFG ladder), rebuild with nvcc 13.0 + torch cu130 env, run the same perf sweeps.
 set -e
-export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM_cu13}"
+export FLASHMLA_CONDA_ENV="${FLASHMLA_CONDA_ENV:-150BLLM}"
 source "$(dirname "${BASH_SOURCE[0]}")/../env_sm120.sh"
 bash "$FMLA_ROOT/build_cu13_sm120.sh"
 
